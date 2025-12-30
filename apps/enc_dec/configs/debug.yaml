@@ -1,0 +1,87 @@
+# Debug configuration for encoder-decoder QA model
+# Small model for quick testing and debugging
+
+name: enc_dec_debug
+dump_dir: outputs/enc_dec_debug
+steps: 100
+seed: 42
+
+# Gradient accumulation
+grad_acc_steps: 1
+gc_collect_freq: 50
+
+# Optimizer settings
+optim:
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup: 10
+  lr_min_ratio: 0.01
+  clip: 1.0
+
+# Distributed training
+distributed:
+  fsdp_type: full_shard
+  compile: false
+  model_dtype: bf16
+  selective_activation_checkpointing: false
+
+# Model configuration
+model:
+  dim: 256
+  max_encoder_seqlen: 512
+  max_decoder_seqlen: 128
+  vocab_size: -1
+  weight_tying: false
+  share_embeddings: true
+
+  encoder:
+    n_layers: 2
+    n_heads: 4
+    n_kv_heads: 4
+    ffn_dim_multiplier: 1.0
+    multiple_of: 64
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+  decoder:
+    n_layers: 2
+    n_heads: 4
+    n_kv_heads: 4
+    ffn_dim_multiplier: 1.0
+    multiple_of: 64
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+# Data configuration
+data:
+  dataset_name: squad
+  dataset_config: null
+  dataset_split: train
+  question_column: question
+  answer_column: answers
+  context_column: context
+  max_encoder_len: 512
+  max_decoder_len: 128
+  batch_size: 4
+  seed: 42
+  add_bos: true
+  add_eos: true
+  num_workers: 0
+  prefetch_factor: 2
+  tokenizer:
+    name: bytes
+
+# Checkpointing
+checkpoint:
+  dump:
+    every: 50
+    keep: 2
+  eval:
+    every: 100
+    keep: 1
+
+# Logging
+logging:
+  freq: 1

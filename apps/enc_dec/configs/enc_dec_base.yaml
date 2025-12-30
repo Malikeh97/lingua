@@ -1,0 +1,91 @@
+# Base configuration for encoder-decoder QA model
+# Moderate size model for training on QA datasets
+
+name: enc_dec_base
+dump_dir: "!!CHANGETHIS!!"
+steps: 50000
+seed: 42
+
+# Gradient accumulation
+grad_acc_steps: 4
+gc_collect_freq: 1000
+
+# Optimizer settings
+optim:
+  lr: 3e-4
+  weight_decay: 0.033
+  warmup: 2000
+  lr_min_ratio: 0.000001
+  clip: 1.0
+
+# Distributed training
+distributed:
+  fsdp_type: full_shard
+  compile: true
+  model_dtype: bf16
+  selective_activation_checkpointing: true
+
+# Model configuration
+model:
+  dim: 768
+  max_encoder_seqlen: 2048
+  max_decoder_seqlen: 512
+  vocab_size: -1
+  weight_tying: false
+  share_embeddings: true
+
+  encoder:
+    n_layers: 6
+    n_heads: 12
+    n_kv_heads: 12
+    ffn_dim_multiplier: 1.5
+    multiple_of: 256
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+  decoder:
+    n_layers: 6
+    n_heads: 12
+    n_kv_heads: 12
+    ffn_dim_multiplier: 1.5
+    multiple_of: 256
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+# Data configuration
+data:
+  dataset_name: "!!CHANGETHIS!!"
+  dataset_config: null
+  dataset_split: train
+  question_column: question
+  answer_column: answer
+  context_column: gold_doc
+  max_encoder_len: 2048
+  max_decoder_len: 512
+  batch_size: 8
+  seed: 42
+  add_bos: true
+  add_eos: true
+  num_workers: 4
+  prefetch_factor: 2
+  tokenizer:
+    name: bytes
+
+# Checkpointing
+checkpoint:
+  dump:
+    every: 1000
+    keep: 3
+  eval:
+    every: 2500
+    keep: -1
+
+# Logging
+logging:
+  freq: 10
+
+# Profiling (optional)
+profiling:
+  run: false
