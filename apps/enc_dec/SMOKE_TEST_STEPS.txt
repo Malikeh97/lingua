@@ -1,0 +1,87 @@
+================================================================================
+           SMOKE TEST: 1.3B Encoder-Decoder Model on Killarney
+================================================================================
+
+Model: ~1.3B params (Encoder: 6 layers, Decoder: 22 layers, dim=2048)
+Dataset: SQuAD (HuggingFace)
+GPUs: 4x L40s (48GB each)
+Steps: 200
+
+================================================================================
+STEP 1: CREATE ENVIRONMENT (one-time setup)
+================================================================================
+
+cd /project/6104653/ehghaghi/lingua
+sbatch setup/create_env_killarney.sh
+
+# Wait for job to complete
+squeue -u $USER
+
+# Check logs
+tail -f /home/ehghaghi/scratch/ehghaghi/logs/lingua_env_*.out
+
+Environment will be at: /home/ehghaghi/scratch/ehghaghi/envs/lingua_env/
+
+================================================================================
+STEP 2: SUBMIT TRAINING JOB
+================================================================================
+
+cd /project/6104653/ehghaghi/lingua
+sbatch apps/enc_dec/submit_smoke_test.slurm
+
+================================================================================
+STEP 3: MONITOR TRAINING
+================================================================================
+
+# Check job status
+squeue -u $USER
+
+# Watch logs (once job starts)
+tail -f /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/logs/enc_dec_smoke_1b_*.out
+
+================================================================================
+STEP 4: VERIFY SUCCESS
+================================================================================
+
+# Check metrics (loss should decrease from ~8-12 to ~6-8)
+tail -20 /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/metrics.jsonl
+
+# Check checkpoints exist
+ls -la /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/checkpoints/
+
+# Check training log
+cat /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/train.log
+
+================================================================================
+FILES CREATED
+================================================================================
+
+Config:     apps/enc_dec/configs/smoke_test_1b.yaml
+SLURM:      apps/enc_dec/submit_smoke_test.slurm
+Env Setup:  setup/create_env_killarney.sh
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+OOM Error:
+  - Edit smoke_test_1b.yaml: set data.batch_size: 1
+  - Or reduce data.max_encoder_len: 512
+
+Slow Data Loading:
+  - SQuAD downloads on first run (~5 min)
+  - Set data.num_workers: 0 to debug
+
+NCCL Timeout:
+  - Add to SLURM script: export NCCL_TIMEOUT=3600
+
+================================================================================
+OUTPUT LOCATIONS
+================================================================================
+
+Logs:        /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/logs/
+Metrics:     /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/metrics.jsonl
+Checkpoints: /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/checkpoints/
+Train Log:   /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/train.log
+
+================================================================================

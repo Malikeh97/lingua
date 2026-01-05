@@ -1,0 +1,93 @@
+# Smoke test configuration for 1.3B encoder-decoder model
+# Encoder: 6 layers (~300M params, DistilBERT-like depth)
+# Decoder: 22 layers (~1B params, Llama 1B-like)
+# Total: ~1.3B parameters
+
+name: enc_dec_smoke_1b
+dump_dir: /home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b
+steps: 200
+seed: 42
+
+# Gradient accumulation
+grad_acc_steps: 2
+gc_collect_freq: 100
+
+# Optimizer settings (conservative for smoke test)
+optim:
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup: 50
+  lr_min_ratio: 0.01
+  clip: 1.0
+
+# Distributed training - optimized for L40s 48GB
+distributed:
+  fsdp_type: full_shard
+  compile: false
+  model_dtype: bf16
+  selective_activation_checkpointing: true
+
+# Model configuration - 1.3B encoder-decoder
+model:
+  dim: 2048
+  max_encoder_seqlen: 1024
+  max_decoder_seqlen: 256
+  vocab_size: -1
+  weight_tying: false
+  share_embeddings: true
+
+  encoder:
+    n_layers: 6
+    n_heads: 16
+    n_kv_heads: 8
+    ffn_dim_multiplier: 1.5
+    multiple_of: 256
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+  decoder:
+    n_layers: 22
+    n_heads: 16
+    n_kv_heads: 8
+    ffn_dim_multiplier: 1.5
+    multiple_of: 256
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+# Data configuration - SQuAD dataset
+data:
+  dataset_name: squad
+  dataset_config: null
+  dataset_split: train
+  question_column: question
+  answer_column: answers
+  context_column: context
+  max_encoder_len: 1024
+  max_decoder_len: 256
+  batch_size: 2
+  seed: 42
+  add_bos: true
+  add_eos: true
+  num_workers: 2
+  prefetch_factor: 2
+  tokenizer:
+    name: bytes
+
+# Checkpointing - frequent for smoke test
+checkpoint:
+  dump:
+    every: 100
+    keep: 2
+  eval:
+    every: 200
+    keep: 1
+
+# Logging - verbose for debugging
+logging:
+  freq: 5
+
+# Profiling disabled for smoke test
+profiling:
+  run: false

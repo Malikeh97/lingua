@@ -234,6 +234,10 @@ class CrossAttention(nn.Module):
                     # Already an attention mask
                     attn_mask = encoder_mask
 
+            # Cast mask to match query dtype for mixed precision training
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(dtype=xq.dtype)
+
             output = F.scaled_dot_product_attention(
                 xq, xk, xv,
                 attn_mask=attn_mask,

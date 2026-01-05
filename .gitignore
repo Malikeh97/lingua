@@ -3,3 +3,36 @@
 *.ipynb
 slurm-*.out
 wandb
+
+# Byte-code files
+*.pyc
+__pycache__/
+# for example, in a project with a src/ directory
+*.pyd
+
+# Generated files
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Editors and IDEs
+.idea/  # pycharm
+.vscode/ # VS Code (often ignored via global gitignore)
+
+# Specific files
+.env
+.flaskenv
+# secrets.toml (or other files containing credentials)
+pip-log.txt
+pip-selfcheck.json
+
+# OS-generated files
+.DS_Store # macOS
+Thumbs.db # Windows
