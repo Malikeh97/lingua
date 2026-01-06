@@ -14,7 +14,7 @@
 
 name: mvp_modernbert
 dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert
-steps: 1000
+steps: 2000
 seed: 42
 
 # Gradient accumulation
@@ -23,9 +23,9 @@ gc_collect_freq: 100
 
 # Optimizer settings
 optim:
-  lr: 3e-4
+  lr: 1e-4
   weight_decay: 0.01
-  warmup: 100
+  warmup: 200
   lr_min_ratio: 0.01
   clip: 1.0
 
@@ -78,7 +78,7 @@ data:
   dataset_name: squad
   dataset_config: null
   dataset_split: train
-  max_samples: 1000
+  # max_samples: 1000
   question_column: question
   answer_column: answers
   context_column: context
