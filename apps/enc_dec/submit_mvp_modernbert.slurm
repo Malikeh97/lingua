@@ -5,7 +5,7 @@
 #SBATCH --partition=gpubase_l40s_b3
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=250GB
+#SBATCH --mem=64GB
 #SBATCH --account=aip-craffel
 #SBATCH --time=04:00:00
 #SBATCH --signal=USR2@120

@@ -18,7 +18,7 @@ steps: 1000
 seed: 42
 
 # Gradient accumulation
-grad_acc_steps: 4
+grad_acc_steps: 2
 gc_collect_freq: 100
 
 # Optimizer settings
@@ -29,9 +29,9 @@ optim:
   lr_min_ratio: 0.01
   clip: 1.0
 
-# Distributed training
+# Distributed training (single GPU - no sharding needed)
 distributed:
-  fsdp_type: full_shard
+  fsdp_type: no_shard
   compile: false
   model_dtype: bf16
   selective_activation_checkpointing: true
@@ -84,7 +84,7 @@ data:
   context_column: context
   max_encoder_len: 1024  # Context length for documents
   max_decoder_len: 256   # Question + answer length
-  batch_size: 4
+  batch_size: 8
   seed: 42
   add_bos: true
   add_eos: true
