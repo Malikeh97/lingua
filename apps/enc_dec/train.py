@@ -79,8 +79,10 @@ class EncDecTrainArgs:
 
     gc_collect_freq: int = 1000
 
-    # Number of optimizer steps to take
-    steps: int = 10000
+    # Number of optimizer steps to take (if None, use max_epochs)
+    steps: Optional[int] = None
+    # Number of epochs to train (used when steps is None)
+    max_epochs: Optional[int] = None
 
     # Data configuration
     data: EncDecDataArgs = field(default_factory=EncDecDataArgs)
@@ -170,6 +172,12 @@ def validate_train_args(args: EncDecTrainArgs, vocab_size: int):
             f"Setting Data Parallel size to {args.distributed.dp_replicate * args.distributed.dp_shard}"
         )
 
+    # Validate steps/epochs configuration
+    if args.steps is None and args.max_epochs is None:
+        raise ValueError("Either 'steps' or 'max_epochs' must be specified")
+    if args.steps is not None and args.max_epochs is not None:
+        logger.warning("Both 'steps' and 'max_epochs' specified. 'steps' takes priority.")
+
     # Set max sequence lengths
     args.model.max_encoder_seqlen = args.data.max_encoder_len
     args.model.max_decoder_seqlen = args.data.max_decoder_len
@@ -194,6 +202,13 @@ def every_n_steps(train_state, freq, acc_step=None, acc_freq=None):
     elif acc_freq is not None:
         test = test and ((train_state.acc_step % acc_freq) == 0)
     return test
+
+
+def should_continue_training(step: int, epoch: int, args: EncDecTrainArgs) -> bool:
+    """Check if training should continue based on steps or epochs."""
+    if args.steps is not None:
+        return step < args.steps
+    return epoch < args.max_epochs
 
 
 def train(args: EncDecTrainArgs):
@@ -314,8 +329,28 @@ def train(args: EncDecTrainArgs):
         )
         logger.info(f"GPU memory usage: {gpu_memory_monitor}")
 
+        # Build data loader (needed to compute total_steps for epoch-based training)
+        data_loader = build_infinite_qa_dataloader(
+            args.data,
+            dp_rank,
+            dp_degree,
+            split="train",
+        )
+
+        # Compute total steps for scheduler
+        if args.steps is not None:
+            total_steps = args.steps
+        else:
+            batches_per_epoch = len(data_loader)
+            steps_per_epoch = batches_per_epoch // args.grad_acc_steps
+            total_steps = steps_per_epoch * args.max_epochs
+            logger.info(
+                f"Using max_epochs={args.max_epochs}, batches_per_epoch={batches_per_epoch}, "
+                f"steps_per_epoch={steps_per_epoch}, total_steps={total_steps}"
+            )
+
         # Build optimizer
-        optimizer, scheduler = build_optimizer(model, args.optim, args.steps)
+        optimizer, scheduler = build_optimizer(model, args.optim, total_steps)
 
         # Initialize data loader state
         data_loader_state = init_dataloader_state()
@@ -340,13 +375,7 @@ def train(args: EncDecTrainArgs):
             MetricLogger(Path(args.dump_dir) / "metrics.jsonl", args)
         )
 
-        # Build data loader
-        data_loader = build_infinite_qa_dataloader(
-            args.data,
-            dp_rank,
-            dp_degree,
-            split="train",
-        )
+        # Set data loader epoch from checkpoint state
         data_loader.set_epoch(train_state.data_loader_state.epoch)
 
         torch_profiler = context_stack.enter_context(
@@ -357,7 +386,8 @@ def train(args: EncDecTrainArgs):
         time_last_log = timer()
         gc.collect()
 
-        while train_state.step < args.steps:
+        saved = False
+        while should_continue_training(train_state.step, data_loader.epoch, args):
             train_state.acc_step += 1
             train_state.acc_step = train_state.acc_step % args.grad_acc_steps
 

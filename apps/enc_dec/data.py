@@ -315,6 +315,10 @@ class InfiniteDataLoader:
         self.epoch = epoch
         self.sampler.set_epoch(epoch)
 
+    def __len__(self) -> int:
+        """Return number of batches per epoch."""
+        return len(self.dataloader)
+
 
 def build_infinite_qa_dataloader(
     args: EncDecDataArgs,

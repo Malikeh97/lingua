@@ -14,7 +14,8 @@
 
 name: mvp_modernbert
 dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert
-steps: 2000
+# steps: 2000
+max_epochs: 1
 seed: 42
 
 # Gradient accumulation

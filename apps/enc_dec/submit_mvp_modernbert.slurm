@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64GB
 #SBATCH --account=aip-craffel
-#SBATCH --time=04:00:00
+#SBATCH --time=03:00:00
 #SBATCH --signal=USR2@120
 
 echo "============================================"
@@ -26,9 +26,11 @@ source /home/ehghaghi/scratch/ehghaghi/envs/lingua_env/bin/activate
 
 # Set environment variables
 export SCRATCH="/home/ehghaghi/scratch/ehghaghi"
-export HUGGINGFACE_HUB_CACHE=$SCRATCH/.cache
-export HF_HOME=$SCRATCH/.cache/huggingface
+export HUGGINGFACE_HUB_CACHE="$SCRATCH/.cache"
+export HF_HOME="$SCRATCH/.cache/huggingface"
 export TMPDIR="$SCRATCH/tmp"
+export TRITON_CACHE_DIR="$TMPDIR/triton"
+export TORCH_EXTENSIONS_DIR="$TMPDIR/torch_extensions"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
@@ -38,6 +40,8 @@ export NCCL_DEBUG=INFO
 mkdir -p $SCRATCH/mvp_modernbert/logs
 mkdir -p $SCRATCH/.cache/huggingface
 mkdir -p $SCRATCH/tmp
+mkdir -p $SCRATCH/tmp/triton
+mkdir -p $SCRATCH/tmp/torch_extensions
 
 cd /project/6104653/ehghaghi/lingua
 
