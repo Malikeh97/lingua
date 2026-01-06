@@ -1,0 +1,116 @@
+# MVP configuration: Frozen ModernBERT encoder + trainable decoder
+# This is the simplest MVP for testing retrieval-augmented generation
+#
+# Encoder: ModernBERT-base (149M params, frozen)
+#   - 768d hidden, 12 layers, 12 heads
+#   - Supports up to 8192 context length
+#   - Pre-trained on 2T tokens of English + code
+#
+# Decoder: Small decoder (~100M params, trainable)
+#   - 768d hidden (matches encoder dim, no projection needed)
+#   - 6 layers, 12 heads
+#
+# Cross-attention: Standard softmax (quadratic, but proven)
+
+name: mvp_modernbert
+dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert
+steps: 1000
+seed: 42
+
+# Gradient accumulation
+grad_acc_steps: 4
+gc_collect_freq: 100
+
+# Optimizer settings
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+  warmup: 100
+  lr_min_ratio: 0.01
+  clip: 1.0
+
+# Distributed training
+distributed:
+  fsdp_type: full_shard
+  compile: false
+  model_dtype: bf16
+  selective_activation_checkpointing: true
+
+# Model configuration
+model:
+  # Decoder dimension - matches ModernBERT (768) so no projection needed
+  dim: 768
+  max_encoder_seqlen: 2048
+  max_decoder_seqlen: 512
+  vocab_size: -1
+  weight_tying: true
+  share_embeddings: false  # Not used for pretrained encoder
+
+  # Use pretrained encoder
+  encoder_type: pretrained
+
+  # Pretrained encoder config
+  pretrained_encoder:
+    model_name: answerdotai/ModernBERT-base
+    encoder_dim: 768  # Must match model above
+    pooling: none  # Use all tokens for cross-attention
+    use_flash_attention: true
+
+  # Encoder args (not used when encoder_type=pretrained)
+  encoder:
+    n_layers: 6
+    n_heads: 12
+    n_kv_heads: 12
+
+  # Decoder: 6-layer transformer
+  decoder:
+    n_layers: 6
+    n_heads: 12
+    n_kv_heads: 12
+    ffn_dim_multiplier: 2.67  # ~2048 hidden dim
+    multiple_of: 256
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+# Data configuration - SQuAD for testing
+data:
+  dataset_name: squad
+  dataset_config: null
+  dataset_split: train
+  max_samples: 1000
+  question_column: question
+  answer_column: answers
+  context_column: context
+  max_encoder_len: 1024  # Context length for documents
+  max_decoder_len: 256   # Question + answer length
+  batch_size: 4
+  seed: 42
+  add_bos: true
+  add_eos: true
+  num_workers: 4
+  prefetch_factor: 2
+
+  # Use ModernBERT tokenizer for encoder input
+  encoder_tokenizer_name: answerdotai/ModernBERT-base
+
+  # Decoder tokenizer (bytes tokenizer for simplicity)
+  tokenizer:
+    name: bytes
+
+# Checkpointing
+checkpoint:
+  dump:
+    every: 200
+    keep: 3
+  eval:
+    every: 500
+    keep: 2
+
+# Logging
+logging:
+  freq: 10
+
+# Profiling disabled
+profiling:
+  run: false

@@ -36,6 +36,13 @@ class AttentionType(Enum):
     CROSS_ATTENTION = "cross"
 
 
+class EncoderType(Enum):
+    """Types of encoder architectures available."""
+    TRAINABLE = "trainable"  # Full trainable encoder (current implementation)
+    PRETRAINED = "pretrained"  # Frozen pretrained encoder (e.g., ModernBERT)
+    EMBEDDING_ONLY = "embedding_only"  # Just embeddings, no encoder layers
+
+
 @dataclass
 class EncoderArgs:
     """Encoder-specific transformer arguments."""
@@ -67,6 +74,19 @@ class DecoderArgs:
 
 
 @dataclass
+class PretrainedEncoderArgs:
+    """Arguments for pretrained encoder (e.g., ModernBERT).
+
+    The encoder is loaded from HuggingFace and kept frozen.
+    A projection layer maps from encoder_dim to decoder dim if needed.
+    """
+    model_name: str = "answerdotai/ModernBERT-base"  # HuggingFace model name
+    encoder_dim: int = 768  # Hidden dim of the pretrained model
+    pooling: str = "none"  # "none" (use all tokens), "mean", "cls"
+    use_flash_attention: bool = True  # Use flash attention in ModernBERT if available
+
+
+@dataclass
 class EncDecTransformerArgs:
     """Combined encoder-decoder configuration.
 
@@ -77,13 +97,17 @@ class EncDecTransformerArgs:
     max_encoder_seqlen: int = 2048
     max_decoder_seqlen: int = 512
 
+    # Encoder type: "trainable", "pretrained", or "embedding_only"
+    encoder_type: str = "trainable"
+
     encoder: EncoderArgs = field(default_factory=EncoderArgs)
     decoder: DecoderArgs = field(default_factory=DecoderArgs)
+    pretrained_encoder: PretrainedEncoderArgs = field(default_factory=PretrainedEncoderArgs)
 
     seed: int = 42
     vocab_size: int = -1
     weight_tying: bool = False
-    share_embeddings: bool = True
+    share_embeddings: bool = True  # Only used when encoder_type="trainable"
 
 
 def create_causal_mask(seqlen: int, attn_impl: str) -> Union[BlockMask, AttentionBias, str]:
@@ -525,6 +549,173 @@ class Encoder(nn.Module):
             layer.init_weights(self.init_base_std, factor)
 
 
+class PretrainedEncoder(nn.Module):
+    """Frozen pretrained encoder (e.g., ModernBERT) with projection layer.
+
+    Loads a HuggingFace model and keeps it frozen during training.
+    Adds a trainable projection layer if encoder_dim != decoder_dim.
+    """
+
+    def __init__(self, args: EncDecTransformerArgs):
+        super().__init__()
+
+        self.dim = args.dim  # Target dimension (decoder's dim)
+        self.max_seqlen = args.max_encoder_seqlen
+
+        pretrained_args = args.pretrained_encoder
+        self.model_name = pretrained_args.model_name
+        self.encoder_dim = pretrained_args.encoder_dim
+        self.pooling = pretrained_args.pooling
+        self.use_flash_attention = pretrained_args.use_flash_attention
+
+        # Load pretrained model from HuggingFace
+        # Defer import to avoid dependency if not using pretrained encoder
+        from transformers import AutoModel, AutoConfig
+
+        config = AutoConfig.from_pretrained(self.model_name)
+        # Enable flash attention if requested and supported
+        if self.use_flash_attention:
+            config.attn_implementation = "flash_attention_2"
+
+        self.encoder = AutoModel.from_pretrained(
+            self.model_name,
+            config=config,
+            torch_dtype=torch.bfloat16,
+        )
+
+        # Freeze all encoder parameters
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+        # Projection layer if dimensions don't match
+        self.projection = None
+        if self.encoder_dim != self.dim:
+            self.projection = nn.Linear(self.encoder_dim, self.dim, bias=False)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        attn_impl: str = "sdpa",  # Ignored, HF model handles its own attention
+    ) -> torch.Tensor:
+        """
+        Args:
+            input_ids: [B, enc_seq] token IDs
+            padding_mask: [B, enc_seq] boolean mask (True for valid tokens)
+            attn_impl: Ignored for pretrained encoder
+
+        Returns:
+            Encoder output [B, enc_seq, D] where D is args.dim
+        """
+        # Convert padding mask to attention mask format expected by HuggingFace
+        # HF expects: 1 for tokens to attend to, 0 for tokens to ignore
+        attention_mask = None
+        if padding_mask is not None:
+            attention_mask = padding_mask.long()
+
+        # Run through frozen encoder
+        with torch.no_grad():
+            outputs = self.encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            hidden_states = outputs.last_hidden_state  # [B, seq, encoder_dim]
+
+        # Apply pooling if specified
+        if self.pooling == "mean":
+            if padding_mask is not None:
+                mask = padding_mask.unsqueeze(-1).float()
+                hidden_states = (hidden_states * mask).sum(dim=1, keepdim=True) / mask.sum(dim=1, keepdim=True)
+            else:
+                hidden_states = hidden_states.mean(dim=1, keepdim=True)
+        elif self.pooling == "cls":
+            hidden_states = hidden_states[:, :1, :]  # Take first token
+
+        # Project to decoder dimension if needed (this is trainable)
+        if self.projection is not None:
+            hidden_states = self.projection(hidden_states)
+
+        return hidden_states
+
+    def reset_parameters(self):
+        """Only reset the projection layer (encoder stays frozen)."""
+        if self.projection is not None:
+            init_std = self.dim ** (-0.5)
+            nn.init.trunc_normal_(
+                self.projection.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+    def init_weights(self):
+        self.reset_parameters()
+
+
+class EmbeddingOnlyEncoder(nn.Module):
+    """Simple encoder that only applies embeddings (no transformer layers).
+
+    Uses the decoder's embedding layer to embed documents.
+    Optionally adds a learned projection.
+    """
+
+    def __init__(
+        self,
+        args: EncDecTransformerArgs,
+        shared_embeddings: Optional[nn.Embedding] = None,
+    ):
+        super().__init__()
+
+        self.dim = args.dim
+        self.vocab_size = args.vocab_size
+        self.max_seqlen = args.max_encoder_seqlen
+
+        # Use shared embeddings if provided, otherwise create new ones
+        if shared_embeddings is not None:
+            self.tok_embeddings = shared_embeddings
+            self._shared = True
+        else:
+            self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+            self._shared = False
+
+        # Optional: Add layer norm for stability
+        self.norm = RMSNorm(args.dim, eps=1e-5)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        """
+        Args:
+            input_ids: [B, enc_seq] token IDs
+            padding_mask: Unused for embedding-only encoder
+            attn_impl: Unused
+
+        Returns:
+            Embeddings [B, enc_seq, D]
+        """
+        h = self.tok_embeddings(input_ids)
+        return self.norm(h)
+
+    def reset_parameters(self):
+        self.norm.reset_parameters()
+        if not self._shared:
+            init_std = self.dim ** (-0.5)
+            nn.init.trunc_normal_(
+                self.tok_embeddings.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+    def init_weights(self):
+        self.reset_parameters()
+
+
 class Decoder(nn.Module):
     """Full decoder stack with embeddings and output projection."""
 
@@ -668,21 +859,38 @@ class Decoder(nn.Module):
 
 
 class EncDecTransformer(nn.Module):
-    """Full encoder-decoder transformer model."""
+    """Full encoder-decoder transformer model.
+
+    Supports three encoder types:
+    - "trainable": Full trainable transformer encoder (original implementation)
+    - "pretrained": Frozen pretrained encoder (e.g., ModernBERT)
+    - "embedding_only": Just embeddings, no transformer layers
+    """
 
     def __init__(self, args: EncDecTransformerArgs):
         super().__init__()
 
         self.args = args
         self.dim = args.dim
+        self.encoder_type = EncoderType(args.encoder_type)
         self.share_embeddings = args.share_embeddings
 
-        # Build encoder
-        self.encoder = Encoder(args)
-
-        # Build decoder with optional shared embeddings
-        shared_emb = self.encoder.tok_embeddings if args.share_embeddings else None
-        self.decoder = Decoder(args, shared_embeddings=shared_emb)
+        # Build encoder based on type
+        if self.encoder_type == EncoderType.PRETRAINED:
+            self.encoder = PretrainedEncoder(args)
+            # For pretrained encoder, decoder always has its own embeddings
+            self.decoder = Decoder(args, shared_embeddings=None)
+        elif self.encoder_type == EncoderType.EMBEDDING_ONLY:
+            # Build decoder first, then share embeddings with encoder
+            self.decoder = Decoder(args, shared_embeddings=None)
+            self.encoder = EmbeddingOnlyEncoder(
+                args,
+                shared_embeddings=self.decoder.tok_embeddings if args.share_embeddings else None
+            )
+        else:  # TRAINABLE (default)
+            self.encoder = Encoder(args)
+            shared_emb = self.encoder.tok_embeddings if args.share_embeddings else None
+            self.decoder = Decoder(args, shared_embeddings=shared_emb)
 
     def forward(
         self,
@@ -722,11 +930,23 @@ class EncDecTransformer(nn.Module):
 
     def reset_parameters(self):
         self.encoder.reset_parameters()
-        self.decoder.reset_parameters(shared_embeddings=self.share_embeddings)
+        # For pretrained encoder, decoder embeddings are never shared
+        # For embedding_only, share_embeddings controls whether encoder uses decoder's embeddings
+        if self.encoder_type == EncoderType.PRETRAINED:
+            self.decoder.reset_parameters(shared_embeddings=False)
+        elif self.encoder_type == EncoderType.EMBEDDING_ONLY:
+            self.decoder.reset_parameters(shared_embeddings=False)
+        else:
+            self.decoder.reset_parameters(shared_embeddings=self.share_embeddings)
 
     def init_weights(self):
         self.encoder.init_weights()
-        self.decoder.init_weights(shared_embeddings=self.share_embeddings)
+        if self.encoder_type == EncoderType.PRETRAINED:
+            self.decoder.init_weights(shared_embeddings=False)
+        elif self.encoder_type == EncoderType.EMBEDDING_ONLY:
+            self.decoder.init_weights(shared_embeddings=False)
+        else:
+            self.decoder.init_weights(shared_embeddings=self.share_embeddings)
 
 
 def get_num_flop_per_token_enc_dec(
@@ -754,19 +974,33 @@ def get_num_flop_per_token_enc_dec(
 def build_fsdp_grouping_plan(model_args: EncDecTransformerArgs) -> List[Tuple[str, bool]]:
     """Define FSDP sharding groups for encoder-decoder model."""
     group_plan = []
+    encoder_type = EncoderType(model_args.encoder_type)
 
-    # Encoder embeddings
-    group_plan.append(("encoder.tok_embeddings", False))
+    if encoder_type == EncoderType.PRETRAINED:
+        # For pretrained encoder, put entire frozen encoder in one group
+        # Only the projection layer (if any) is trainable
+        group_plan.append(("encoder.encoder", False))  # Frozen HF model
+        if model_args.pretrained_encoder.encoder_dim != model_args.dim:
+            group_plan.append(("encoder.projection", False))
 
-    # Encoder layers
-    for i in range(model_args.encoder.n_layers):
-        group_plan.append((f"encoder.layers.{i}", False))
+    elif encoder_type == EncoderType.EMBEDDING_ONLY:
+        # Simple encoder: just embeddings and norm
+        group_plan.append(("encoder.tok_embeddings", False))
+        group_plan.append(("encoder.norm", False))
 
-    # Encoder norm
-    group_plan.append(("encoder.norm", False))
+    else:  # TRAINABLE
+        # Encoder embeddings
+        group_plan.append(("encoder.tok_embeddings", False))
 
-    # Decoder embeddings (if not shared)
-    if not model_args.share_embeddings:
+        # Encoder layers
+        for i in range(model_args.encoder.n_layers):
+            group_plan.append((f"encoder.layers.{i}", False))
+
+        # Encoder norm
+        group_plan.append(("encoder.norm", False))
+
+    # Decoder embeddings (always separate for pretrained/embedding_only)
+    if encoder_type != EncoderType.TRAINABLE or not model_args.share_embeddings:
         group_plan.append(("decoder.tok_embeddings", False))
 
     # Decoder layers

@@ -22,6 +22,7 @@ class EncDecDataArgs:
     dataset_name: str = ""
     dataset_config: Optional[str] = None
     dataset_split: str = "train"
+    max_samples: Optional[int] = None  # Limit number of samples (None = use all)
 
     # Column names in the dataset
     question_column: str = "question"
@@ -38,8 +39,12 @@ class EncDecDataArgs:
     add_bos: bool = True
     add_eos: bool = True
 
-    # Tokenizer configuration
+    # Tokenizer configuration (used for decoder, and encoder if encoder_tokenizer not set)
     tokenizer: TokenizerArgs = field(default_factory=TokenizerArgs)
+
+    # Optional: separate encoder tokenizer (for pretrained encoders like ModernBERT)
+    # If set, uses HuggingFace AutoTokenizer for encoder input
+    encoder_tokenizer_name: Optional[str] = None  # e.g., "answerdotai/ModernBERT-base"
 
     # Data loading
     num_workers: int = 4
@@ -52,6 +57,8 @@ class QADataset(Dataset):
     Encoder input: gold_doc tokens
     Decoder input: question tokens + answer tokens (concatenated)
     Decoder labels: -100 for question positions, answer tokens for answer positions
+
+    Supports separate tokenizers for encoder and decoder when using pretrained encoders.
     """
 
     def __init__(
@@ -61,8 +68,17 @@ class QADataset(Dataset):
         split: str = "train",
     ):
         self.args = args
-        self.tokenizer = tokenizer
+        self.tokenizer = tokenizer  # Decoder tokenizer
         self.split = split
+
+        # Setup encoder tokenizer (separate from decoder if specified)
+        self.encoder_tokenizer = None
+        self.use_hf_encoder_tokenizer = args.encoder_tokenizer_name is not None
+
+        if self.use_hf_encoder_tokenizer:
+            from transformers import AutoTokenizer
+            self.encoder_tokenizer = AutoTokenizer.from_pretrained(args.encoder_tokenizer_name)
+            logger.info(f"Using HuggingFace encoder tokenizer: {args.encoder_tokenizer_name}")
 
         # Load HuggingFace dataset
         from datasets import load_dataset
@@ -74,7 +90,12 @@ class QADataset(Dataset):
         else:
             self.dataset = load_dataset(args.dataset_name, split=split)
 
-        logger.info(f"Loaded {len(self.dataset)} examples from {args.dataset_name} ({split})")
+        # Limit number of samples if specified
+        if args.max_samples is not None and args.max_samples < len(self.dataset):
+            self.dataset = self.dataset.select(range(args.max_samples))
+            logger.info(f"Limited to {args.max_samples} samples from {args.dataset_name} ({split})")
+        else:
+            logger.info(f"Loaded {len(self.dataset)} examples from {args.dataset_name} ({split})")
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -94,13 +115,26 @@ class QADataset(Dataset):
             # SQuAD-style answer format
             answer = answer["text"][0] if answer["text"] else ""
 
-        # Tokenize components
-        doc_tokens = self.tokenizer.encode(
-            context,
-            add_bos=self.args.add_bos,
-            add_eos=self.args.add_eos,
-        )
+        # Tokenize encoder input (context/document)
+        if self.use_hf_encoder_tokenizer:
+            # Use HuggingFace tokenizer for encoder (e.g., ModernBERT)
+            enc_output = self.encoder_tokenizer(
+                context,
+                truncation=True,
+                max_length=self.args.max_encoder_len,
+                return_tensors=None,
+                add_special_tokens=True,
+            )
+            doc_tokens = enc_output["input_ids"]
+        else:
+            # Use lingua tokenizer
+            doc_tokens = self.tokenizer.encode(
+                context,
+                add_bos=self.args.add_bos,
+                add_eos=self.args.add_eos,
+            )
 
+        # Tokenize decoder input (question + answer) - always use lingua tokenizer
         question_tokens = self.tokenizer.encode(
             question,
             add_bos=self.args.add_bos,  # BOS at start of decoder input

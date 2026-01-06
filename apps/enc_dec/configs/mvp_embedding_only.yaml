@@ -1,0 +1,98 @@
+# MVP configuration: Embedding-only encoder + trainable decoder
+# Simplest possible MVP - uses decoder embeddings to embed documents
+#
+# This is useful for:
+# - Quick debugging and testing
+# - Ablation studies (comparing to pretrained encoder)
+# - Resource-constrained environments
+#
+# No separate encoder model - just embeddings + layer norm
+
+name: mvp_embedding_only
+dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_embedding_only
+steps: 500
+seed: 42
+
+# Gradient accumulation
+grad_acc_steps: 2
+gc_collect_freq: 100
+
+# Optimizer settings
+optim:
+  lr: 3e-4
+  weight_decay: 0.01
+  warmup: 50
+  lr_min_ratio: 0.01
+  clip: 1.0
+
+# Distributed training
+distributed:
+  fsdp_type: full_shard
+  compile: false
+  model_dtype: bf16
+  selective_activation_checkpointing: true
+
+# Model configuration
+model:
+  dim: 512
+  max_encoder_seqlen: 1024
+  max_decoder_seqlen: 256
+  vocab_size: -1
+  weight_tying: true
+  share_embeddings: true  # Share embeddings between encoder and decoder
+
+  # Use embedding-only encoder
+  encoder_type: embedding_only
+
+  # Encoder args (not used for embedding_only)
+  encoder:
+    n_layers: 6
+    n_heads: 8
+
+  # Decoder: small 4-layer transformer
+  decoder:
+    n_layers: 4
+    n_heads: 8
+    n_kv_heads: 8
+    ffn_dim_multiplier: 2.67
+    multiple_of: 256
+    norm_eps: 1e-5
+    rope_theta: 10000.0
+    init_std_factor: disabled
+
+# Data configuration
+data:
+  dataset_name: squad
+  dataset_config: null
+  dataset_split: train
+  max_samples: 500
+  question_column: question
+  answer_column: answers
+  context_column: context
+  max_encoder_len: 512
+  max_decoder_len: 128
+  batch_size: 8
+  seed: 42
+  add_bos: true
+  add_eos: true
+  num_workers: 2
+  prefetch_factor: 2
+  tokenizer:
+    name: bytes
+
+# Checkpointing
+checkpoint:
+  dump:
+    every: 200
+    keep: 2
+  eval:
+    every: 500
+    keep: 1
+
+# Logging
+logging:
+  freq: 10
+
+# Profiling disabled
+profiling:
+  run: false

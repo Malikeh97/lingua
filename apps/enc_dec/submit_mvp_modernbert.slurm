@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=enc_dec_smoke_1b
-#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/logs/%x_%j.out
-#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/enc_dec_smoke_1b/logs/%x_%j.err
+#SBATCH --job-name=mvp_modernbert
+#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert/logs/%x_%j.out
+#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert/logs/%x_%j.err
 #SBATCH --partition=gpubase_l40s_b3
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=250GB
 #SBATCH --account=aip-craffel
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --signal=USR2@120
 
 echo "============================================"
@@ -27,29 +27,38 @@ source /home/ehghaghi/scratch/ehghaghi/envs/lingua_env/bin/activate
 # Set environment variables
 export SCRATCH="/home/ehghaghi/scratch/ehghaghi"
 export HUGGINGFACE_HUB_CACHE=$SCRATCH/.cache
+export HF_HOME=$SCRATCH/.cache/huggingface
 export TMPDIR="$SCRATCH/tmp"
-export OMP_NUM_THREADS=1 # Limit CPU threads for better performance
-export MKL_NUM_THREADS=1 # Limit MKL threads for better performance
-export TORCH_NCCL_AVOID_RECORD_STREAMS=1 # Avoid NCCL record streams issues
-export NCCL_DEBUG=INFO # Enable NCCL debug info
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export NCCL_DEBUG=INFO
 
 # Create directories
-mkdir -p $SCRATCH/enc_dec_smoke_1b/logs
-mkdir -p $SCRATCH/.cache
+mkdir -p $SCRATCH/mvp_modernbert/logs
+mkdir -p $SCRATCH/.cache/huggingface
 mkdir -p $SCRATCH/tmp
 
 cd /project/6104653/ehghaghi/lingua
 
 echo "============================================"
-echo "Starting training at $(date)"
-echo "Config: apps/enc_dec/configs/smoke_test_1b.yaml"
+echo "MVP: Frozen ModernBERT encoder + trainable decoder"
+echo "Config: apps/enc_dec/configs/mvp_modernbert.yaml"
 echo "============================================"
 
-# Run training with torchrun (4 GPUs on single node)
+# Pre-download ModernBERT model (optional, helps with logging)
+echo "Checking ModernBERT model availability..."
+python -c "from transformers import AutoModel, AutoTokenizer; AutoTokenizer.from_pretrained('answerdotai/ModernBERT-base'); print('ModernBERT tokenizer ready')" 2>/dev/null || echo "Will download during training"
+
+echo "============================================"
+echo "Starting training at $(date)"
+echo "============================================"
+
+# Run training
 torchrun --nproc-per-node 1 \
     --master-port 29500 \
     -m apps.enc_dec.train \
-    config=apps/enc_dec/configs/smoke_test_1b.yaml
+    config=apps/enc_dec/configs/mvp_modernbert.yaml
 
 echo "============================================"
 echo "Job finished at $(date)"

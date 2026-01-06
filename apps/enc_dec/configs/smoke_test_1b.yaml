@@ -61,12 +61,13 @@ data:
   dataset_name: squad
   dataset_config: null
   dataset_split: train
+  max_samples: 100  # Only use first 1000 samples
   question_column: question
   answer_column: answers
   context_column: context
-  max_encoder_len: 1024
+  max_encoder_len: 512
   max_decoder_len: 256
-  batch_size: 2
+  batch_size: 1
   seed: 42
   add_bos: true
   add_eos: true

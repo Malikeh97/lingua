@@ -48,6 +48,7 @@ from lingua.tokenizer import build_tokenizer
 from apps.enc_dec.enc_dec import (
     EncDecTransformerArgs,
     EncDecTransformer,
+    EncoderType,
     build_fsdp_grouping_plan,
     get_no_recompute_ops,
     get_num_flop_per_token_enc_dec,
@@ -232,19 +233,37 @@ def train(args: EncDecTrainArgs):
         torch.manual_seed(args.seed)
         logger.info("Building model")
 
-        # Initialize model on meta device
-        with torch.device("meta"):
+        # Check encoder type
+        encoder_type = EncoderType(args.model.encoder_type)
+        logger.info(f"Using encoder type: {encoder_type.value}")
+
+        # Initialize model
+        # For pretrained encoder, we can't use meta device for the encoder
+        if encoder_type == EncoderType.PRETRAINED:
+            logger.info(f"Loading pretrained encoder: {args.model.pretrained_encoder.model_name}")
+            # Build model directly - pretrained encoder loads weights from HuggingFace
             model = EncDecTransformer(args.model)
+        else:
+            # Initialize on meta device for efficiency
+            with torch.device("meta"):
+                model = EncDecTransformer(args.model)
 
         logger.info("Model is built!")
 
+        # Parameter counting
         model_param_count = get_num_params(model)
         encoder_param_count = get_num_params(model.encoder)
         decoder_param_count = get_num_params(model.decoder)
 
+        # Count trainable parameters
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = model_param_count - trainable_params
+
         logger.info(f"Total parameters: {model_param_count:,}")
         logger.info(f"Encoder parameters: {encoder_param_count:,}")
         logger.info(f"Decoder parameters: {decoder_param_count:,}")
+        logger.info(f"Trainable parameters: {trainable_params:,}")
+        logger.info(f"Frozen parameters: {frozen_params:,}")
 
         # Parallelize model
         model = parallelize_model(
@@ -258,19 +277,32 @@ def train(args: EncDecTrainArgs):
         )
 
         # Initialize weights
-        model = model.to_empty(device="cuda")
-
-        if args.checkpoint.init_ckpt_path:
-            logger.info(f"Loading initial model from {args.checkpoint.init_ckpt_path}")
-            load_from_checkpoint(
-                args.checkpoint.init_ckpt_path, model, model_key="model"
-            )
-            model.encoder.rope_embeddings.reset_parameters()
-            model.decoder.rope_embeddings.reset_parameters()
-        else:
+        # For pretrained encoder, encoder is already on device with weights
+        if encoder_type == EncoderType.PRETRAINED:
+            # Move decoder to cuda (encoder already has weights loaded)
+            model = model.cuda()
+            # Initialize only the trainable parts (decoder + projection layer)
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
                 torch.manual_seed(args.model.seed)
-                model.init_weights()
+                # Initialize decoder weights
+                model.decoder.init_weights(shared_embeddings=False)
+                # Initialize projection layer if it exists
+                if hasattr(model.encoder, 'projection') and model.encoder.projection is not None:
+                    model.encoder.reset_parameters()
+        else:
+            model = model.to_empty(device="cuda")
+
+            if args.checkpoint.init_ckpt_path:
+                logger.info(f"Loading initial model from {args.checkpoint.init_ckpt_path}")
+                load_from_checkpoint(
+                    args.checkpoint.init_ckpt_path, model, model_key="model"
+                )
+                model.encoder.rope_embeddings.reset_parameters()
+                model.decoder.rope_embeddings.reset_parameters()
+            else:
+                with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+                    torch.manual_seed(args.model.seed)
+                    model.init_weights()
 
         check_model_value_range(model, range=10.0, std=1.0)
 
