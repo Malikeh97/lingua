@@ -2,7 +2,7 @@
 
 **Application:** `apps/enc_dec`
 **Built on:** Lingua Framework
-**Author:** Ehsan Ghahghaei
+**Author:** Malikeh Ehghaghi
 **Date:** January 2026
 
 ---
