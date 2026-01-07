@@ -106,7 +106,11 @@ class QADataset(Dataset):
         # Get text fields
         context = item[self.args.context_column]
         question = item[self.args.question_column]
-        answer = item[self.args.answer_column]
+        answer = item[self.args.answer_column]['text'][0] #TODO fix for squad only
+
+        print(f"Context: {context}")
+        print(f"Question: {question}")
+        print(f"Answer: {answer}")
 
         # Handle different answer formats (some datasets have list of answers)
         if isinstance(answer, list):

@@ -43,7 +43,7 @@ mkdir -p $SCRATCH/tmp
 mkdir -p $SCRATCH/tmp/triton
 mkdir -p $SCRATCH/tmp/torch_extensions
 
-cd /project/6104653/ehghaghi/lingua
+cd /project/aip-craffel/ehghaghi/lingua
 
 echo "============================================"
 echo "MVP: Frozen ModernBERT encoder + trainable decoder"
