@@ -67,7 +67,7 @@ echo "============================================"
 torchrun --nproc-per-node 1 \
     --master-port 29500 \
     -m apps.enc_dec.train \
-    config=apps/enc_dec/configs/mvp_modernbert.yaml
+    config=apps/enc_dec/configs/mvp_modernbert_base_300M.yaml
 
 echo "============================================"
 echo "Job finished at $(date)"

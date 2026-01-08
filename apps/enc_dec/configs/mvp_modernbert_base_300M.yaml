@@ -1,0 +1,91 @@
+name: mvp_modernbert
+dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_base_300M
+max_epochs: 1
+seed: 42
+grad_acc_steps: 2
+gc_collect_freq: 100
+optim:
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup: 200
+  lr_min_ratio: 0.01
+  clip: 1.0
+distributed:
+  fsdp_type: no_shard
+  compile: false
+  model_dtype: bf16
+  selective_activation_checkpointing: true
+model:
+  # NOTE: decoder is now 960d (Nemotron-style), while ModernBERT encoder is 768d.
+  # This means you NEED an encoder->decoder projection for cross-attention unless your code already handles it.
+  dim: 960  # was 768 :contentReference[oaicite:1]{index=1}
+
+  max_encoder_seqlen: 2048
+  max_decoder_seqlen: 4096
+
+  vocab_size: 128256   # was -1 :contentReference[oaicite:2]{index=2}
+  weight_tying: false  # was true :contentReference[oaicite:3]{index=3}
+  share_embeddings: false
+
+  encoder_type: pretrained
+
+  pretrained_encoder:
+    model_name: answerdotai/ModernBERT-base
+    encoder_dim: 768
+    pooling: none
+    use_flash_attention: true
+
+  # Encoder args (not used when encoder_type=pretrained)
+  encoder:
+    n_layers: 6
+    n_heads: 12
+    n_kv_heads: 12
+
+  # Decoder: Nemotron_fineinstructions_..._300M-style
+  decoder:
+    n_layers: 32
+    n_heads: 15
+    n_kv_heads: 5
+    ffn_dim_multiplier: null
+    multiple_of: 256
+    norm_eps: 1e-5
+    rope_theta: 100000.0
+    init_std_factor: disabled
+
+data:
+  dataset_name: squad
+  dataset_config: null
+  dataset_split: train
+  question_column: question
+  answer_column: answers
+  context_column: context
+  max_encoder_len: 1024
+  max_decoder_len: 256
+  batch_size: 8
+  seed: 42
+  add_bos: true
+  add_eos: true
+  num_workers: 4
+  prefetch_factor: 2
+  encoder_tokenizer_name: answerdotai/ModernBERT-base
+  tokenizer:
+    name: tiktoken
+    path: /home/ehghaghi/projects/aip-craffel/ehghaghi/lingua/tokenizers/llama3_tiktoken_bpe_tokenizer/original/tokenizer.model
+checkpoint:
+  dump:
+    every: 500
+    keep: -1
+  eval:
+    every: 500
+    keep: -1
+profiling:
+  run: true
+  trace_folder: profiling
+  mem_warmup: 0
+  mem_steps: 4
+  profile_warmup: 100
+  profile_steps: 4
+logging:
+  freq: 1
+  acc_freq: null
+  wandb: null
