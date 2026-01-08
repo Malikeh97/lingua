@@ -50,15 +50,6 @@ mkdir -p $SCRATCH/tmp/torch_extensions
 
 cd /project/aip-craffel/ehghaghi/lingua
 
-
-python << 'EOF'
-import tiktoken
-
-enc = tiktoken.get_encoding("llama3")
-print("Downloaded LLaMA-3 tokenizer")
-print("Vocab size:", enc.n_vocab)
-EOF
-
 echo "============================================"
 echo "MVP: Frozen ModernBERT encoder + trainable decoder"
 echo "Config: apps/enc_dec/configs/mvp_modernbert.yaml"
