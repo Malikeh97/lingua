@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=mvp_modernbert
-#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert/logs/%x_%j.out
-#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert/logs/%x_%j.err
+#SBATCH --job-name=mvp_modernbert_base_300M
+#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_base_300M/logs/%x_%j.out
+#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_base_300M/logs/%x_%j.err
 #SBATCH --partition=gpubase_l40s_b3
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=16
@@ -52,7 +52,7 @@ cd /project/aip-craffel/ehghaghi/lingua
 
 echo "============================================"
 echo "MVP: Frozen ModernBERT encoder + trainable decoder"
-echo "Config: apps/enc_dec/configs/mvp_modernbert.yaml"
+echo "Config: apps/enc_dec/configs/mvp_modernbert_base_300M.yaml"
 echo "============================================"
 
 # Pre-download ModernBERT model (optional, helps with logging)

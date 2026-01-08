@@ -78,6 +78,8 @@ checkpoint:
   eval:
     every: 500
     keep: -1
+  path: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_base_300M/checkpoints
+  init_ckpt_path: null
 profiling:
   run: true
   trace_folder: profiling
