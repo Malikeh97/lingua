@@ -26,8 +26,13 @@ source /home/ehghaghi/scratch/ehghaghi/envs/lingua_env/bin/activate
 
 # Set environment variables
 export SCRATCH="/home/ehghaghi/scratch/ehghaghi"
-export HUGGINGFACE_HUB_CACHE="$SCRATCH/.cache"
 export HF_HOME="$SCRATCH/.cache/huggingface"
+export HF_HUB_CACHE="$HF_HOME/hub"
+export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE" 
+export HF_DATASETS_CACHE="$HF_HOME/datasets"
+export XDG_CACHE_HOME="$SCRATCH/.cache"
+
+
 export TMPDIR="$SCRATCH/tmp"
 export TRITON_CACHE_DIR="$TMPDIR/triton"
 export TORCH_EXTENSIONS_DIR="$TMPDIR/torch_extensions"
@@ -38,12 +43,21 @@ export NCCL_DEBUG=INFO
 
 # Create directories
 mkdir -p $SCRATCH/mvp_modernbert/logs
-mkdir -p $SCRATCH/.cache/huggingface
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_DATASETS_CACHE"
 mkdir -p $SCRATCH/tmp
 mkdir -p $SCRATCH/tmp/triton
 mkdir -p $SCRATCH/tmp/torch_extensions
 
 cd /project/aip-craffel/ehghaghi/lingua
+
+
+python << 'EOF'
+import tiktoken
+
+enc = tiktoken.get_encoding("llama3")
+print("Downloaded LLaMA-3 tokenizer")
+print("Vocab size:", enc.n_vocab)
+EOF
 
 echo "============================================"
 echo "MVP: Frozen ModernBERT encoder + trainable decoder"

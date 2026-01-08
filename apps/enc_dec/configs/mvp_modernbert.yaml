@@ -94,15 +94,16 @@ data:
   # Use ModernBERT tokenizer for encoder input
   encoder_tokenizer_name: answerdotai/ModernBERT-base
 
-  # Decoder tokenizer (bytes tokenizer for simplicity)
+  # Decoder tokenizer
   tokenizer:
-    name: bytes
+    name: tiktoken
+    path: /home/ehghaghi/projects/aip-craffel/ehghaghi/lingua/tokenizers/llama3_tiktoken_bpe_tokenizer/original/tokenizer.model
 
 # Checkpointing
 checkpoint:
   dump:
     every: 200
-    keep: 3
+    keep: 2
   eval:
     every: 500
     keep: 2

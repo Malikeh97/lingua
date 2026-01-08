@@ -186,7 +186,8 @@ class QADataset(Dataset):
 
 def qa_collate_fn(
     batch: List[Dict[str, torch.Tensor]],
-    pad_id: int,
+    encoder_pad_id: int,
+    decoder_pad_id: int,
     max_encoder_len: int,
     max_decoder_len: int,
 ) -> Dict[str, torch.Tensor]:
@@ -221,9 +222,9 @@ def qa_collate_fn(
         enc_len = enc_input.shape[0]
         dec_len = dec_input.shape[0]
 
-        # Pad encoder
+        # Pad encoder (use encoder's pad token to avoid vocab size mismatch)
         enc_padded = F.pad(
-            enc_input, (0, max_enc_len_batch - enc_len), value=pad_id
+            enc_input, (0, max_enc_len_batch - enc_len), value=encoder_pad_id
         )
         encoder_inputs.append(enc_padded)
 
@@ -232,9 +233,9 @@ def qa_collate_fn(
         enc_mask[:enc_len] = True
         encoder_masks.append(enc_mask)
 
-        # Pad decoder
+        # Pad decoder (use decoder's pad token)
         dec_padded = F.pad(
-            dec_input, (0, max_dec_len_batch - dec_len), value=pad_id
+            dec_input, (0, max_dec_len_batch - dec_len), value=decoder_pad_id
         )
         decoder_inputs.append(dec_padded)
 
@@ -268,12 +269,22 @@ def build_qa_dataloader(
         seed=args.seed,
     )
 
-    # Get pad token ID (use EOS if no dedicated pad token)
-    pad_id = getattr(tokenizer, "pad_id", tokenizer.eos_id)
+    # Get decoder pad token ID (use EOS if no dedicated pad token)
+    decoder_pad_id = getattr(tokenizer, "pad_id", tokenizer.eos_id)
+
+    # Get encoder pad token ID (from HF tokenizer if using pretrained encoder)
+    if args.encoder_tokenizer_name:
+        from transformers import AutoTokenizer
+        enc_tokenizer = AutoTokenizer.from_pretrained(args.encoder_tokenizer_name)
+        encoder_pad_id = enc_tokenizer.pad_token_id if enc_tokenizer.pad_token_id is not None else 0
+    else:
+        # Same tokenizer for both encoder and decoder
+        encoder_pad_id = decoder_pad_id
 
     collate_fn = partial(
         qa_collate_fn,
-        pad_id=pad_id,
+        encoder_pad_id=encoder_pad_id,
+        decoder_pad_id=decoder_pad_id,
         max_encoder_len=args.max_encoder_len,
         max_decoder_len=args.max_decoder_len,
     )
@@ -342,11 +353,22 @@ def build_infinite_qa_dataloader(
         seed=args.seed,
     )
 
-    pad_id = getattr(tokenizer, "pad_id", tokenizer.eos_id)
+    # Get decoder pad token ID (use EOS if no dedicated pad token)
+    decoder_pad_id = getattr(tokenizer, "pad_id", tokenizer.eos_id)
+
+    # Get encoder pad token ID (from HF tokenizer if using pretrained encoder)
+    if args.encoder_tokenizer_name:
+        from transformers import AutoTokenizer
+        enc_tokenizer = AutoTokenizer.from_pretrained(args.encoder_tokenizer_name)
+        encoder_pad_id = enc_tokenizer.pad_token_id if enc_tokenizer.pad_token_id is not None else 0
+    else:
+        # Same tokenizer for both encoder and decoder
+        encoder_pad_id = decoder_pad_id
 
     collate_fn = partial(
         qa_collate_fn,
-        pad_id=pad_id,
+        encoder_pad_id=encoder_pad_id,
+        decoder_pad_id=decoder_pad_id,
         max_encoder_len=args.max_encoder_len,
         max_decoder_len=args.max_decoder_len,
     )
