@@ -52,17 +52,27 @@ from apps.enc_dec.enc_dec import (
     build_fsdp_grouping_plan,
     get_no_recompute_ops,
     get_num_flop_per_token_enc_dec,
+    load_pretrained_decoder_weights,
 )
 from apps.enc_dec.data import (
     EncDecDataArgs,
     build_infinite_qa_dataloader,
+    build_train_val_dataloaders,
     EncDecDataLoaderState,
     init_dataloader_state,
 )
+from apps.enc_dec.eval import evaluate_validation
 
 import wandb
 
 logger = logging.getLogger()
+
+
+@dataclass
+class EvalArgs:
+    """Evaluation configuration for validation during training."""
+    every: int = 100  # Evaluate every N optimizer steps
+    max_steps: Optional[int] = None  # Limit number of validation steps (None = full val set)
 
 
 @dataclass
@@ -106,8 +116,8 @@ class EncDecTrainArgs:
     # Logging
     logging: LoggingArgs = field(default_factory=LoggingArgs)
 
-    # Evaluation (optional)
-    eval: Optional[Any] = None
+    # Evaluation during training
+    eval: EvalArgs = field(default_factory=EvalArgs)
 
 
 @dataclass
@@ -252,12 +262,30 @@ def train(args: EncDecTrainArgs):
         encoder_type = EncoderType(args.model.encoder_type)
         logger.info(f"Using encoder type: {encoder_type.value}")
 
+        # Check if using pretrained decoder
+        use_pretrained_decoder = (
+            args.model.pretrained_decoder.model_name
+            and len(args.model.pretrained_decoder.model_name) > 0
+        )
+
         # Initialize model
-        # For pretrained encoder, we can't use meta device for the encoder
-        if encoder_type == EncoderType.PRETRAINED:
-            logger.info(f"Loading pretrained encoder: {args.model.pretrained_encoder.model_name}")
-            # Build model directly - pretrained encoder loads weights from HuggingFace
+        # For pretrained encoder or pretrained decoder, we can't use meta device
+        if encoder_type == EncoderType.PRETRAINED or use_pretrained_decoder:
+            if encoder_type == EncoderType.PRETRAINED:
+                logger.info(f"Loading pretrained encoder: {args.model.pretrained_encoder.model_name}")
+            # Build model directly - pretrained components load weights from HuggingFace
             model = EncDecTransformer(args.model)
+
+            # Load pretrained decoder weights BEFORE parallelization
+            if use_pretrained_decoder:
+                logger.info(f"Loading pretrained decoder from: {args.model.pretrained_decoder.model_name}")
+                load_pretrained_decoder_weights(
+                    decoder=model.decoder,
+                    model_name=args.model.pretrained_decoder.model_name,
+                    freeze_pretrained=args.model.pretrained_decoder.freeze_pretrained,
+                    init_base_std=args.model.decoder.init_base_std,
+                    seed=args.model.seed,
+                )
         else:
             # Initialize on meta device for efficiency
             with torch.device("meta"):
@@ -292,16 +320,20 @@ def train(args: EncDecTrainArgs):
         )
 
         # Initialize weights
-        # For pretrained encoder, encoder is already on device with weights
-        if encoder_type == EncoderType.PRETRAINED:
-            # Move decoder to cuda (encoder already has weights loaded)
+        # For pretrained encoder or pretrained decoder, weights are already loaded before parallelization
+        if encoder_type == EncoderType.PRETRAINED or use_pretrained_decoder:
+            # Move model to cuda (encoder already has weights loaded, decoder may have pretrained weights)
             model = model.cuda()
-            # Initialize only the trainable parts (decoder + projection layer)
-            with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-                torch.manual_seed(args.model.seed)
-                # Initialize decoder weights
-                model.decoder.init_weights(shared_embeddings=False)
-                # Initialize projection layer if it exists
+
+            if not use_pretrained_decoder:
+                # Only initialize decoder if we didn't load pretrained weights
+                with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+                    torch.manual_seed(args.model.seed)
+                    # Initialize decoder weights
+                    model.decoder.init_weights(shared_embeddings=False)
+
+            # Initialize projection layer if it exists (for pretrained encoder)
+            if encoder_type == EncoderType.PRETRAINED:
                 if hasattr(model.encoder, 'projection') and model.encoder.projection is not None:
                     model.encoder.reset_parameters()
         else:
@@ -329,13 +361,15 @@ def train(args: EncDecTrainArgs):
         )
         logger.info(f"GPU memory usage: {gpu_memory_monitor}")
 
-        # Build data loader (needed to compute total_steps for epoch-based training)
-        data_loader = build_infinite_qa_dataloader(
+        # Build data loaders (train and optionally validation)
+        data_loader, val_loader = build_train_val_dataloaders(
             args.data,
             dp_rank,
             dp_degree,
-            split="train",
         )
+
+        if val_loader is not None:
+            logger.info(f"Validation enabled: evaluating every {args.eval.every} steps")
 
         # Compute total steps for scheduler
         if args.steps is not None:
@@ -520,8 +554,11 @@ def train(args: EncDecTrainArgs):
                 nwords_since_last_log = 0
                 time_last_log = timer()
 
+                epoch_progress = data_loader.get_epoch_progress()
                 logger.info(
-                    f"step: {train_state.step}"
+                    f"global_step: {train_state.step}"
+                    f"  epoch: {data_loader.epoch}"
+                    f"  epoch_pct: {epoch_progress:.1f}%"
                     f"  acc: {train_state.acc_step}"
                     f"  loss: {round(loss.item(), 4):>7}"
                     f"  grad: {grad_norm:.2e}"
@@ -531,6 +568,26 @@ def train(args: EncDecTrainArgs):
                     f"  data: {data_load_time:>5}"
                     f"  lr: {curr_lr:.2e}"
                     f"  mem: {gpu_mem_stats.max_active_pct:.0f}%"
+                )
+
+            # Validation evaluation
+            if val_loader is not None and every_n_steps(train_state, args.eval.every, acc_step=0):
+                logger.info(f"Running validation at step {train_state.step}...")
+                val_metrics = evaluate_validation(
+                    model, val_loader, max_steps=args.eval.max_steps
+                )
+                model.train()  # Switch back to training mode
+
+                # Log validation metrics
+                val_metrics_flat = {f"eval/{k}": v for k, v in val_metrics.items()}
+                val_metrics_flat["global_step"] = train_state.step
+                if get_is_master():
+                    metric_logger.log(val_metrics_flat)
+
+                logger.info(
+                    f"Validation: step={train_state.step}"
+                    f"  val_loss={val_metrics['val_loss']:.4f}"
+                    f"  val_ppl={val_metrics['val_perplexity']:.2f}"
                 )
 
             # Checkpointing

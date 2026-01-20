@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Dict, List, Optional, Any, Iterator
+from typing import Dict, List, Optional, Any, Iterator, Tuple
 import logging
 
 import torch
@@ -46,6 +46,10 @@ class EncDecDataArgs:
     # If set, uses HuggingFace AutoTokenizer for encoder input
     encoder_tokenizer_name: Optional[str] = None  # e.g., "answerdotai/ModernBERT-base"
 
+    # Train/validation split
+    # If > 0, splits the training data into train/val (e.g., 0.1 = 10% for validation)
+    val_split_ratio: float = 0.0
+
     # Data loading
     num_workers: int = 4
     prefetch_factor: int = 2
@@ -66,6 +70,7 @@ class QADataset(Dataset):
         args: EncDecDataArgs,
         tokenizer,
         split: str = "train",
+        hf_dataset=None,  # Optional: pass pre-loaded/split HF dataset
     ):
         self.args = args
         self.tokenizer = tokenizer  # Decoder tokenizer
@@ -80,22 +85,27 @@ class QADataset(Dataset):
             self.encoder_tokenizer = AutoTokenizer.from_pretrained(args.encoder_tokenizer_name)
             logger.info(f"Using HuggingFace encoder tokenizer: {args.encoder_tokenizer_name}")
 
-        # Load HuggingFace dataset
-        from datasets import load_dataset
-
-        if args.dataset_config:
-            self.dataset = load_dataset(
-                args.dataset_name, args.dataset_config, split=split
-            )
+        # Use provided dataset or load from HuggingFace
+        if hf_dataset is not None:
+            self.dataset = hf_dataset
+            logger.info(f"Using provided dataset with {len(self.dataset)} examples ({split})")
         else:
-            self.dataset = load_dataset(args.dataset_name, split=split)
+            # Load HuggingFace dataset
+            from datasets import load_dataset
 
-        # Limit number of samples if specified
-        if args.max_samples is not None and args.max_samples < len(self.dataset):
-            self.dataset = self.dataset.select(range(args.max_samples))
-            logger.info(f"Limited to {args.max_samples} samples from {args.dataset_name} ({split})")
-        else:
-            logger.info(f"Loaded {len(self.dataset)} examples from {args.dataset_name} ({split})")
+            if args.dataset_config:
+                self.dataset = load_dataset(
+                    args.dataset_name, args.dataset_config, split=split
+                )
+            else:
+                self.dataset = load_dataset(args.dataset_name, split=split)
+
+            # Limit number of samples if specified
+            if args.max_samples is not None and args.max_samples < len(self.dataset):
+                self.dataset = self.dataset.select(range(args.max_samples))
+                logger.info(f"Limited to {args.max_samples} samples from {args.dataset_name} ({split})")
+            else:
+                logger.info(f"Loaded {len(self.dataset)} examples from {args.dataset_name} ({split})")
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -303,6 +313,7 @@ class InfiniteDataLoader:
         self.dataloader = dataloader
         self.sampler = sampler
         self.epoch = 0
+        self.step_in_epoch = 0
         self._iterator = None
 
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
@@ -314,17 +325,29 @@ class InfiniteDataLoader:
             self._iterator = iter(self.dataloader)
 
         try:
-            return next(self._iterator)
+            batch = next(self._iterator)
+            self.step_in_epoch += 1
+            return batch
         except StopIteration:
             self.epoch += 1
+            self.step_in_epoch = 0
             self.sampler.set_epoch(self.epoch)
             self._iterator = iter(self.dataloader)
-            return next(self._iterator)
+            batch = next(self._iterator)
+            self.step_in_epoch += 1
+            return batch
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the sampler."""
         self.epoch = epoch
         self.sampler.set_epoch(epoch)
+
+    def get_epoch_progress(self) -> float:
+        """Return the percentage of the current epoch completed."""
+        total_batches = len(self.dataloader)
+        if total_batches == 0:
+            return 0.0
+        return (self.step_in_epoch / total_batches) * 100.0
 
     def __len__(self) -> int:
         """Return number of batches per epoch."""
@@ -392,3 +415,102 @@ class EncDecDataLoaderState:
 def init_dataloader_state() -> EncDecDataLoaderState:
     """Initialize data loader state."""
     return EncDecDataLoaderState(epoch=0, step_in_epoch=0)
+
+
+def build_train_val_dataloaders(
+    args: EncDecDataArgs,
+    rank: int,
+    world_size: int,
+) -> Tuple[InfiniteDataLoader, Optional[DataLoader]]:
+    """Build train and validation dataloaders with optional train/val split.
+
+    If args.val_split_ratio > 0, splits the training data into train/val.
+    Otherwise, returns only the training dataloader (val_dataloader=None).
+
+    Args:
+        args: Data configuration
+        rank: Current process rank
+        world_size: Total number of processes
+
+    Returns:
+        Tuple of (train_dataloader, val_dataloader)
+        val_dataloader is None if val_split_ratio == 0
+    """
+    from datasets import load_dataset
+
+    tokenizer = build_tokenizer(args.tokenizer.name, args.tokenizer.path)
+
+    # Get pad token IDs
+    decoder_pad_id = getattr(tokenizer, "pad_id", tokenizer.eos_id)
+    if args.encoder_tokenizer_name:
+        from transformers import AutoTokenizer
+        enc_tokenizer = AutoTokenizer.from_pretrained(args.encoder_tokenizer_name)
+        encoder_pad_id = enc_tokenizer.pad_token_id if enc_tokenizer.pad_token_id is not None else 0
+    else:
+        encoder_pad_id = decoder_pad_id
+
+    collate_fn = partial(
+        qa_collate_fn,
+        encoder_pad_id=encoder_pad_id,
+        decoder_pad_id=decoder_pad_id,
+        max_encoder_len=args.max_encoder_len,
+        max_decoder_len=args.max_decoder_len,
+    )
+
+    val_dataloader = None
+
+    if args.val_split_ratio > 0:
+        # Load and split the training data
+        logger.info(f"Splitting training data: {1 - args.val_split_ratio:.0%} train, {args.val_split_ratio:.0%} val")
+
+        if args.dataset_config:
+            full_dataset = load_dataset(args.dataset_name, args.dataset_config, split="train")
+        else:
+            full_dataset = load_dataset(args.dataset_name, split="train")
+
+        # Limit samples before splitting if specified
+        if args.max_samples is not None and args.max_samples < len(full_dataset):
+            full_dataset = full_dataset.select(range(args.max_samples))
+
+        # Split into train/val
+        splits = full_dataset.train_test_split(test_size=args.val_split_ratio, seed=args.seed)
+        train_hf_dataset = splits["train"]
+        val_hf_dataset = splits["test"]
+
+        logger.info(f"Train size: {len(train_hf_dataset)}, Val size: {len(val_hf_dataset)}")
+
+        # Create train dataset and dataloader
+        train_dataset = QADataset(args, tokenizer, split="train", hf_dataset=train_hf_dataset)
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        )
+        train_loader = InfiniteDataLoader(train_dataloader, train_sampler)
+
+        # Create val dataset and dataloader
+        val_dataset = QADataset(args, tokenizer, split="val", hf_dataset=val_hf_dataset)
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world_size, rank=rank, shuffle=False, seed=args.seed
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            collate_fn=collate_fn,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        )
+    else:
+        # No splitting, just build training dataloader
+        train_loader = build_infinite_qa_dataloader(args, rank, world_size, split="train")
+
+    return train_loader, val_dataloader

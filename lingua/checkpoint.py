@@ -60,6 +60,7 @@ class CheckpointArgs:
     path: Optional[str] = None
     init_ckpt_path: Optional[str] = None
     continue_training_from_init: bool = False
+    consolidate: bool = True  # Whether to consolidate checkpoints to .pth after saving
 
 
 def _get_key_step(name: str):
@@ -108,6 +109,7 @@ class CheckpointManager:
         self.eval_every = args.eval
         self.init_ckpt_path = args.init_ckpt_path
         self.continue_training_from_init = args.continue_training_from_init
+        self.consolidate = args.consolidate
 
         assert os.path.exists(self.path), f"Path {self.path} does not exist and needs to be created before using CheckpointManager (use instantiate_and_make_dir)"
 
@@ -253,6 +255,11 @@ class CheckpointManager:
         self.existing_saves.append(curr_save_dir)
 
         self.clean_up()
+
+        # Consolidate checkpoint to .pth format for easy loading
+        if self.consolidate and get_is_master():
+            logger.info(f"Consolidating checkpoint at {curr_save_dir}")
+            consolidate_checkpoints(str(curr_save_dir))
 
         if dist.is_initialized():
             dist.barrier()

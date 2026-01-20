@@ -87,6 +87,18 @@ class PretrainedEncoderArgs:
 
 
 @dataclass
+class PretrainedDecoderArgs:
+    """Arguments for pretrained decoder initialization from HuggingFace.
+
+    Loads weights from a HuggingFace causal LM model (e.g., LLaMA-style).
+    Cross-attention layers are randomly initialized since they don't exist
+    in standard causal LM models.
+    """
+    model_name: str = ""  # HuggingFace model name/path (empty = no pretrained decoder)
+    freeze_pretrained: bool = False  # Whether to freeze loaded weights (cross-attention always trainable)
+
+
+@dataclass
 class EncDecTransformerArgs:
     """Combined encoder-decoder configuration.
 
@@ -103,6 +115,7 @@ class EncDecTransformerArgs:
     encoder: EncoderArgs = field(default_factory=EncoderArgs)
     decoder: DecoderArgs = field(default_factory=DecoderArgs)
     pretrained_encoder: PretrainedEncoderArgs = field(default_factory=PretrainedEncoderArgs)
+    pretrained_decoder: PretrainedDecoderArgs = field(default_factory=PretrainedDecoderArgs)
 
     seed: int = 42
     vocab_size: int = -1
@@ -856,6 +869,141 @@ class Decoder(nn.Module):
                 InitStdFactor.DISABLED: 1.0,
             }[self.init_std_factor]
             layer.init_weights(self.init_base_std, factor)
+
+
+def load_pretrained_decoder_weights(
+    decoder: Decoder,
+    model_name: str,
+    freeze_pretrained: bool = False,
+    init_base_std: Optional[float] = None,
+    seed: int = 42,
+) -> Tuple[int, int]:
+    """Load weights from a HuggingFace causal LM model into the decoder.
+
+    Maps weights from LLaMA-style HF models to the enc_dec decoder.
+    Cross-attention layers are randomly initialized since they don't exist in HF models.
+
+    Args:
+        decoder: The Decoder module to load weights into
+        model_name: HuggingFace model name/path
+        freeze_pretrained: Whether to freeze loaded weights (cross-attention always trainable)
+        init_base_std: Base std for random initialization of cross-attention
+        seed: Random seed for cross-attention initialization
+
+    Returns:
+        Tuple of (loaded_params, initialized_params) counts
+    """
+    from transformers import AutoModelForCausalLM, AutoConfig
+    import logging
+
+    logger = logging.getLogger()
+    logger.info(f"Loading pretrained decoder weights from: {model_name}")
+
+    # Load HuggingFace model
+    config = AutoConfig.from_pretrained(model_name)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        config=config,
+        torch_dtype=torch.bfloat16,
+    )
+
+    hf_state_dict = hf_model.state_dict()
+    decoder_state_dict = decoder.state_dict()
+
+    # Weight mapping: HF -> enc_dec decoder
+    # LLaMA-style naming convention
+    weight_mapping = {}
+
+    # Embeddings
+    if "model.embed_tokens.weight" in hf_state_dict:
+        weight_mapping["tok_embeddings.weight"] = "model.embed_tokens.weight"
+
+    # Final norm
+    if "model.norm.weight" in hf_state_dict:
+        weight_mapping["norm.weight"] = "model.norm.weight"
+
+    # LM head (output projection)
+    if "lm_head.weight" in hf_state_dict:
+        weight_mapping["output.weight"] = "lm_head.weight"
+
+    # Layer-wise mappings
+    n_layers = decoder.n_layers
+    for i in range(n_layers):
+        # Self-attention projections
+        weight_mapping[f"layers.{i}.self_attention.wq.weight"] = f"model.layers.{i}.self_attn.q_proj.weight"
+        weight_mapping[f"layers.{i}.self_attention.wk.weight"] = f"model.layers.{i}.self_attn.k_proj.weight"
+        weight_mapping[f"layers.{i}.self_attention.wv.weight"] = f"model.layers.{i}.self_attn.v_proj.weight"
+        weight_mapping[f"layers.{i}.self_attention.wo.weight"] = f"model.layers.{i}.self_attn.o_proj.weight"
+
+        # FFN (SwiGLU style)
+        weight_mapping[f"layers.{i}.feed_forward.w1.weight"] = f"model.layers.{i}.mlp.gate_proj.weight"
+        weight_mapping[f"layers.{i}.feed_forward.w2.weight"] = f"model.layers.{i}.mlp.down_proj.weight"
+        weight_mapping[f"layers.{i}.feed_forward.w3.weight"] = f"model.layers.{i}.mlp.up_proj.weight"
+
+        # Layer norms
+        weight_mapping[f"layers.{i}.self_attention_norm.weight"] = f"model.layers.{i}.input_layernorm.weight"
+        weight_mapping[f"layers.{i}.ffn_norm.weight"] = f"model.layers.{i}.post_attention_layernorm.weight"
+
+    # Load matched weights
+    loaded_params = 0
+    mismatched_params = []
+
+    for dec_key, hf_key in weight_mapping.items():
+        if hf_key in hf_state_dict and dec_key in decoder_state_dict:
+            hf_weight = hf_state_dict[hf_key]
+            dec_weight = decoder_state_dict[dec_key]
+
+            # Check shape compatibility
+            if hf_weight.shape == dec_weight.shape:
+                decoder_state_dict[dec_key] = hf_weight.clone()
+                loaded_params += hf_weight.numel()
+            else:
+                mismatched_params.append((dec_key, dec_weight.shape, hf_weight.shape))
+                logger.warning(
+                    f"Shape mismatch for {dec_key}: decoder {dec_weight.shape} vs HF {hf_weight.shape}"
+                )
+
+    # Load state dict with matched weights
+    decoder.load_state_dict(decoder_state_dict, strict=False)
+
+    # Initialize cross-attention layers randomly
+    initialized_params = 0
+    init_std = init_base_std or (decoder.dim ** (-0.5))
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()] if torch.cuda.is_available() else []):
+        torch.manual_seed(seed)
+        for i, layer in enumerate(decoder.layers):
+            # Initialize cross-attention weights
+            layer.cross_attention.reset_parameters(init_std)
+            layer.cross_attention_norm.reset_parameters()
+
+            # Count cross-attention params
+            for param in layer.cross_attention.parameters():
+                initialized_params += param.numel()
+            for param in layer.cross_attention_norm.parameters():
+                initialized_params += param.numel()
+
+    # Initialize rope embeddings (not in HF checkpoint)
+    decoder.rope_embeddings.reset_parameters()
+
+    # Optionally freeze pretrained weights
+    if freeze_pretrained:
+        logger.info("Freezing pretrained decoder weights (cross-attention remains trainable)")
+        for name, param in decoder.named_parameters():
+            # Keep cross-attention trainable
+            if "cross_attention" not in name:
+                param.requires_grad = False
+
+    logger.info(f"Loaded {loaded_params:,} parameters from pretrained model")
+    logger.info(f"Randomly initialized {initialized_params:,} parameters (cross-attention)")
+    if mismatched_params:
+        logger.warning(f"Skipped {len(mismatched_params)} parameters due to shape mismatch")
+
+    # Clean up HF model
+    del hf_model
+    del hf_state_dict
+
+    return loaded_params, initialized_params
 
 
 class EncDecTransformer(nn.Module):

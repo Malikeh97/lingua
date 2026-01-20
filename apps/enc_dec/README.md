@@ -27,16 +27,20 @@ apps/enc_dec/
 ├── data.py                     # QA data loader for HuggingFace datasets
 ├── train.py                    # Training script
 ├── eval.py                     # Evaluation script
+├── export_checkpoint.py        # Checkpoint consolidation/export script
+├── infer.py                    # Inference script for QA generation
 ├── README.md                   # This file
 ├── MVP_GUIDE.txt               # Step-by-step guide for MVP testing
 ├── submit_smoke_test.slurm     # SLURM script for smoke test
 ├── submit_mvp_modernbert.slurm # SLURM script for MVP with ModernBERT
 └── configs/
-    ├── debug.yaml              # Small model for debugging
-    ├── enc_dec_base.yaml       # Base configuration
-    ├── smoke_test_1b.yaml      # 1.3B model smoke test
-    ├── mvp_modernbert.yaml     # MVP: Frozen ModernBERT + trainable decoder
-    └── mvp_embedding_only.yaml # MVP: Embedding-only encoder (quick debug)
+    ├── debug.yaml                          # Small model for debugging
+    ├── enc_dec_base.yaml                   # Base configuration
+    ├── smoke_test_1b.yaml                  # 1.3B model smoke test
+    ├── mvp_modernbert.yaml                 # MVP: Frozen ModernBERT + trainable decoder
+    ├── mvp_modernbert_base_300M.yaml       # Frozen ModernBERT + 300M trainable decoder
+    ├── mvp_modernbert_pretrained_dec_300M.yaml  # Frozen ModernBERT + pretrained 300M decoder
+    └── mvp_embedding_only.yaml             # MVP: Embedding-only encoder (quick debug)
 ```
 
 ## Architecture
@@ -58,6 +62,7 @@ class EncDecTransformerArgs:
     encoder: EncoderArgs                # Encoder-specific config
     decoder: DecoderArgs                # Decoder-specific config
     pretrained_encoder: PretrainedEncoderArgs  # Config for pretrained encoder
+    pretrained_decoder: PretrainedDecoderArgs  # Config for pretrained decoder
     share_embeddings: bool = True       # Share encoder/decoder embeddings
 ```
 
@@ -92,6 +97,42 @@ Features:
 - **Automatic projection**: Adds trainable linear layer if `encoder_dim != dim`
 - **Flash attention**: Uses flash_attention_2 for efficiency when available
 - **Separate tokenizer**: Supports using the pretrained model's tokenizer
+
+### Pretrained Decoder
+
+The `PretrainedDecoderArgs` class enables initializing the decoder from a HuggingFace causal LM model (e.g., LLaMA-style models):
+
+```python
+@dataclass
+class PretrainedDecoderArgs:
+    model_name: str = ""           # HuggingFace model name/path (empty = no pretrained)
+    freeze_pretrained: bool = False  # Whether to freeze loaded weights
+```
+
+Features:
+- **Partial weight loading**: Loads matching weights (embeddings, self-attention, FFN, norms) from the HF model
+- **Cross-attention initialization**: Cross-attention layers are randomly initialized since they don't exist in standard causal LM models
+- **Optional freezing**: Can freeze pretrained weights while keeping cross-attention trainable
+- **Architecture matching**: Decoder config (`n_layers`, `n_heads`, etc.) must match the pretrained model
+
+Weight Mapping (LLaMA-style HF model -> enc_dec decoder):
+
+| HuggingFace Model | enc_dec Decoder |
+|-------------------|-----------------|
+| `model.embed_tokens.weight` | `decoder.tok_embeddings.weight` |
+| `model.layers.{i}.self_attn.q_proj` | `decoder.layers.{i}.self_attention.wq` |
+| `model.layers.{i}.self_attn.k_proj` | `decoder.layers.{i}.self_attention.wk` |
+| `model.layers.{i}.self_attn.v_proj` | `decoder.layers.{i}.self_attention.wv` |
+| `model.layers.{i}.self_attn.o_proj` | `decoder.layers.{i}.self_attention.wo` |
+| `model.layers.{i}.mlp.gate_proj` | `decoder.layers.{i}.feed_forward.w1` |
+| `model.layers.{i}.mlp.up_proj` | `decoder.layers.{i}.feed_forward.w3` |
+| `model.layers.{i}.mlp.down_proj` | `decoder.layers.{i}.feed_forward.w2` |
+| `model.layers.{i}.input_layernorm` | `decoder.layers.{i}.self_attention_norm` |
+| `model.layers.{i}.post_attention_layernorm` | `decoder.layers.{i}.ffn_norm` |
+| `model.norm` | `decoder.norm` |
+| `lm_head.weight` | `decoder.output.weight` |
+| N/A (randomly initialized) | `decoder.layers.{i}.cross_attention.*` |
+| N/A (randomly initialized) | `decoder.layers.{i}.cross_attention_norm` |
 
 ### Cross-Attention Implementation
 
@@ -163,6 +204,33 @@ data:
 5. Pad and batch
 ```
 
+### Validation During Training
+
+To evaluate on a held-out validation set during training:
+
+1. Set `val_split_ratio` to hold out a fraction of training data:
+```yaml
+data:
+  val_split_ratio: 0.1  # 10% for validation
+```
+
+2. Configure evaluation frequency:
+```yaml
+eval:
+  every: 100  # Evaluate every 100 optimizer steps
+  max_steps: null  # Use full validation set (or set a number to limit)
+```
+
+**Logged metrics:**
+- `eval/val_loss`: Average cross-entropy loss on validation set
+- `eval/val_perplexity`: Perplexity (exp of val_loss)
+
+**Example log output:**
+```
+Running validation at step 100...
+Validation: step=100  val_loss=2.3456  val_ppl=10.43
+```
+
 ## Usage
 
 ### Quick Start with MVP
@@ -204,6 +272,48 @@ python -m apps.enc_dec.eval \
     ckpt_dir=/path/to/checkpoint
 ```
 
+### Inference
+
+Run inference on a trained model to generate answers for questions:
+
+```bash
+# Using SQuAD validation examples
+python -m apps.enc_dec.infer \
+    --checkpoint /path/to/checkpoint/0000001000/consolidated/consolidated.pth \
+    --config /path/to/checkpoint/0000001000/params.json \
+    --num_examples 5
+
+# Custom document and question
+python -m apps.enc_dec.infer \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --document "Paris is the capital and largest city of France." \
+    --question "What is the capital of France?"
+
+# With sampling parameters
+python -m apps.enc_dec.infer \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --temperature 0.7 \
+    --top_p 0.9 \
+    --max_new_tokens 100
+```
+
+**Inference Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--checkpoint` | Path to consolidated `.pth` file | Required |
+| `--config` | Path to `params.json` config | Required |
+| `--document` | Custom document/context | Uses SQuAD |
+| `--question` | Custom question | Uses SQuAD |
+| `--num_examples` | Number of SQuAD examples | 3 |
+| `--max_new_tokens` | Maximum tokens to generate | 64 |
+| `--temperature` | Sampling temperature (1.0=greedy) | 1.0 |
+| `--top_k` | Top-k sampling | None |
+| `--top_p` | Nucleus sampling | None |
+| `--device` | Device (cuda/cpu) | cuda |
+
 ### Configuration Override
 
 Use dot notation to override nested parameters:
@@ -237,6 +347,47 @@ data:
   encoder_tokenizer_name: answerdotai/ModernBERT-base
   tokenizer:
     name: bytes
+```
+
+### Pretrained Encoder + Pretrained Decoder (mvp_modernbert_pretrained_dec_300M.yaml)
+
+This configuration uses both a frozen pretrained encoder (ModernBERT) and initializes the decoder from a pretrained HuggingFace causal LM model. Cross-attention layers are randomly initialized.
+
+```yaml
+model:
+  dim: 960  # Must match the pretrained decoder's hidden dim
+  encoder_type: pretrained
+  pretrained_encoder:
+    model_name: answerdotai/ModernBERT-base
+    encoder_dim: 768
+    pooling: none
+    use_flash_attention: true
+  pretrained_decoder:
+    model_name: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
+    freeze_pretrained: false  # All weights trainable
+  decoder:
+    # Architecture must match the pretrained model
+    n_layers: 32
+    n_heads: 15
+    n_kv_heads: 5
+    rope_theta: 100000.0
+data:
+  encoder_tokenizer_name: answerdotai/ModernBERT-base
+  tokenizer:
+    name: tiktoken
+    path: /path/to/llama3_tokenizer.model
+```
+
+**Usage:**
+```bash
+python -m apps.enc_dec.train config=apps/enc_dec/configs/mvp_modernbert_pretrained_dec_300M.yaml
+```
+
+**Logs will show:**
+```
+Loading pretrained decoder weights from: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
+Loaded 280,000,000 parameters from pretrained model
+Randomly initialized 20,000,000 parameters (cross-attention)
 ```
 
 ### Embedding-Only Encoder (mvp_embedding_only.yaml)
@@ -297,7 +448,9 @@ The design enables various ablations:
 | Shared embeddings | `model.share_embeddings` |
 | Weight tying | `model.weight_tying` |
 | FFN size | `model.encoder.ffn_dim_multiplier` |
-| Pretrained model | `model.pretrained_encoder.model_name` |
+| Pretrained encoder | `model.pretrained_encoder.model_name` |
+| Pretrained decoder | `model.pretrained_decoder.model_name` |
+| Freeze pretrained decoder | `model.pretrained_decoder.freeze_pretrained` |
 | Pooling strategy | `model.pretrained_encoder.pooling` |
 
 ## Supported Pretrained Encoders
@@ -311,6 +464,22 @@ Any HuggingFace encoder model can be used. Recommended options:
 | `nomic-ai/modernbert-embed-base` | 149M | 768 | 8192 | Optimized for embeddings |
 | `Alibaba-NLP/gte-modernbert-base` | 149M | 768 | 8192 | Good retrieval performance |
 
+## Supported Pretrained Decoders
+
+Any HuggingFace LLaMA-style causal LM model can be used. The decoder config must match the pretrained model architecture.
+
+| Model | Params | Dim | Layers | Heads | Notes |
+|-------|--------|-----|--------|-------|-------|
+| `Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M` | 300M | 960 | 32 | 15 | LLaMA-style, recommended for testing |
+| `meta-llama/Llama-3.2-1B` | 1B | 2048 | 16 | 32 | Meta's small LLaMA model |
+| `nvidia/Nemotron-Mini-4B-Instruct` | 4B | 3072 | 32 | 24 | NVIDIA's instruction-tuned model |
+
+**Important:** When using a pretrained decoder, ensure your decoder config matches:
+- `model.dim` = pretrained model's hidden dimension
+- `model.decoder.n_layers` = pretrained model's number of layers
+- `model.decoder.n_heads` = pretrained model's number of attention heads
+- `model.decoder.n_kv_heads` = pretrained model's number of KV heads (for GQA)
+
 ## Distributed Training
 
 Supports:
@@ -319,6 +488,64 @@ Supports:
 - **Mixed precision**: `distributed.model_dtype: bf16`
 - **Activation checkpointing**: `distributed.selective_activation_checkpointing: true`
 - **Frozen encoder handling**: Pretrained encoder excluded from FSDP sharding
+
+## Checkpoint Consolidation
+
+During distributed training, checkpoints are saved in PyTorch's Distributed Checkpoint (DCP) format, which consists of multiple sharded files. For easier model loading during inference, checkpoints can be automatically consolidated into a single `.pth` file.
+
+### Automatic Consolidation (Enabled by Default)
+
+Checkpoint consolidation is **enabled by default**. After each checkpoint save, a `consolidated/consolidated.pth` file is automatically created:
+
+```
+checkpoints/
+└── 0000001000/
+    ├── __0_0.distcp
+    ├── __1_0.distcp
+    ├── ...
+    ├── params.json
+    ├── train_state_00000.json
+    └── consolidated/
+        ├── consolidated.pth    # Single file with model + optimizer
+        └── params.json
+```
+
+### Disabling Consolidation
+
+To disable automatic consolidation (e.g., to save time during frequent checkpointing):
+
+```yaml
+checkpoint:
+  consolidate: false
+```
+
+### Export Script for Existing Checkpoints
+
+To consolidate existing DCP checkpoints that were saved without consolidation:
+
+```bash
+# Basic export
+python -m apps.enc_dec.export_checkpoint --checkpoint_dir /path/to/checkpoint/0000001000
+
+# Export model weights only (without optimizer state) - smaller file size
+python -m apps.enc_dec.export_checkpoint --checkpoint_dir /path/to/checkpoint/0000001000 --model_only
+```
+
+The `--model_only` flag extracts just the model weights, creating a `model_weights.pth` file that's smaller and suitable for inference.
+
+### Loading Consolidated Checkpoints
+
+```python
+import torch
+
+# Load full checkpoint (model + optimizer)
+checkpoint = torch.load("consolidated/consolidated.pth", map_location="cpu")
+model_state_dict = checkpoint["model"]
+optimizer_state_dict = checkpoint["optim"]
+
+# Or load model-only weights
+model_state_dict = torch.load("consolidated/model_weights.pth", map_location="cpu")
+```
 
 ## Parameter Counting
 
