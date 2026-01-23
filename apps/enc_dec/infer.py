@@ -161,14 +161,26 @@ def encode_question(
     decoder_tokenizer,
     add_bos: bool = True,
     device: str = "cuda",
+    add_separator: bool = True,
 ) -> torch.Tensor:
     """Tokenize question for decoder input.
+
+    Args:
+        question: The question string
+        decoder_tokenizer: Tokenizer for encoding
+        add_bos: Whether to add BOS token
+        device: Device to put tensor on
+        add_separator: Whether to add "\\nAnswer:" separator after question
 
     Returns:
         input_ids tensor
     """
     if decoder_tokenizer is None:
         raise ValueError("Decoder tokenizer not available")
+
+    # Add separator to match training format
+    if add_separator:
+        question = question + "\nAnswer:"
 
     tokens = decoder_tokenizer.encode(question, add_bos=add_bos, add_eos=False)
     input_ids = torch.tensor([tokens], dtype=torch.long, device=device)

@@ -144,9 +144,11 @@ class QADataset(Dataset):
                 add_eos=self.args.add_eos,
             )
 
-        # Tokenize decoder input (question + answer) - always use lingua tokenizer
+        # Tokenize decoder input (question + separator + answer) - always use lingua tokenizer
+        # Add separator between question and answer for clearer boundary
+        question_with_sep = question + "\nAnswer:"
         question_tokens = self.tokenizer.encode(
-            question,
+            question_with_sep,
             add_bos=self.args.add_bos,  # BOS at start of decoder input
             add_eos=False,  # No EOS between question and answer
         )

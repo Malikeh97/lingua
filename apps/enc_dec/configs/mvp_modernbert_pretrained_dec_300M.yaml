@@ -33,6 +33,8 @@ model:
     encoder_dim: 768
     pooling: none
     use_flash_attention: true
+    freeze_encoder: true  # Set to false to train full encoder
+    unfreeze_top_layers: 2  # Set to N to unfreeze top N layers (e.g., 2-4)
 
   # Pretrained decoder from HuggingFace
   # Cross-attention layers will be randomly initialized since they don't exist in the HF model

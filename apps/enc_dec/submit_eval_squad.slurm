@@ -56,7 +56,7 @@ SQUAD_DEV_FILE="/home/ehghaghi/projects/aip-craffel/ehghaghi/lingua/apps/enc_dec
 OUTPUT_DIR="$SCRATCH/mvp_modernbert_pretrained_dec_300M/eval_results/$(basename $LATEST_STEP)"
 
 # Percentage of dev data to evaluate (1-100)
-EVAL_PERCENT=5
+EVAL_PERCENT=10
 
 echo "============================================"
 echo "Running SQuAD Evaluation"

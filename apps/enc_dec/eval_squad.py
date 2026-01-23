@@ -144,8 +144,12 @@ def encode_question(
     decoder_tokenizer,
     add_bos: bool = True,
     device: str = "cuda",
+    add_separator: bool = True,
 ) -> torch.Tensor:
     """Tokenize question for decoder input."""
+    # Add separator to match training format
+    if add_separator:
+        question = question + "\nAnswer:"
     tokens = decoder_tokenizer.encode(question, add_bos=add_bos, add_eos=False)
     input_ids = torch.tensor([tokens], dtype=torch.long, device=device)
     return input_ids
@@ -236,7 +240,8 @@ def load_squad_data(data_file: str) -> Tuple[List[Dict], Dict[str, bool]]:
                 qid_to_has_ans[qid] = not is_impossible
 
                 if is_impossible:
-                    answers = []
+                    #answers = []
+                    continue  # Skip unanswerable questions for now
                 else:
                     answers = [a['text'] for a in qa['answers']]
 

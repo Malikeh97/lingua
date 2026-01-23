@@ -27,12 +27,14 @@ apps/enc_dec/
 ├── data.py                     # QA data loader for HuggingFace datasets
 ├── train.py                    # Training script
 ├── eval.py                     # Evaluation script
+├── eval_squad.py               # SQuAD 2.0 evaluation with official EM/F1 metrics
 ├── export_checkpoint.py        # Checkpoint consolidation/export script
 ├── infer.py                    # Inference script for QA generation
 ├── README.md                   # This file
 ├── MVP_GUIDE.txt               # Step-by-step guide for MVP testing
 ├── submit_smoke_test.slurm     # SLURM script for smoke test
 ├── submit_mvp_modernbert.slurm # SLURM script for MVP with ModernBERT
+├── submit_eval_squad.slurm     # SLURM script for SQuAD evaluation
 └── configs/
     ├── debug.yaml                          # Small model for debugging
     ├── enc_dec_base.yaml                   # Base configuration
@@ -41,6 +43,35 @@ apps/enc_dec/
     ├── mvp_modernbert_base_300M.yaml       # Frozen ModernBERT + 300M trainable decoder
     ├── mvp_modernbert_pretrained_dec_300M.yaml  # Frozen ModernBERT + pretrained 300M decoder
     └── mvp_embedding_only.yaml             # MVP: Embedding-only encoder (quick debug)
+```
+
+## Trainable Components
+
+The following table shows what components are trainable based on configuration:
+
+### With Pretrained Encoder + Pretrained Decoder
+
+| Component | Config Setting | Trainable? |
+|-----------|----------------|------------|
+| **Encoder (ModernBERT)** | | |
+| └─ Bottom layers | `freeze_encoder: true` | Frozen |
+| └─ Top N layers | `unfreeze_top_layers: N` | Trainable |
+| └─ Projection (768→dim) | Always | Trainable |
+| **Decoder (from HF)** | | |
+| └─ Embeddings | `freeze_pretrained: false` | Trainable |
+| └─ Self-attention | `freeze_pretrained: false` | Trainable |
+| └─ FFN layers | `freeze_pretrained: false` | Trainable |
+| └─ Output projection | `freeze_pretrained: false` | Trainable |
+| **Cross-Attention** | | |
+| └─ All layers | Always (randomly init) | Trainable |
+
+**Example config:**
+```yaml
+pretrained_encoder:
+  freeze_encoder: true
+  unfreeze_top_layers: 2    # Train top 2 encoder layers
+pretrained_decoder:
+  freeze_pretrained: false  # Train all decoder weights
 ```
 
 ## Architecture
@@ -90,13 +121,37 @@ class PretrainedEncoderArgs:
     encoder_dim: int = 768                            # Hidden dim of pretrained model
     pooling: str = "none"                             # "none", "mean", or "cls"
     use_flash_attention: bool = True                  # Use flash attention if available
+    freeze_encoder: bool = True                       # Whether to freeze encoder weights
+    unfreeze_top_layers: int = 0                      # Number of top layers to unfreeze
 ```
 
 Features:
-- **Frozen weights**: Encoder parameters have `requires_grad=False`
+- **Frozen weights**: Encoder parameters have `requires_grad=False` by default
+- **Partial fine-tuning**: Unfreeze top N layers with `unfreeze_top_layers`
 - **Automatic projection**: Adds trainable linear layer if `encoder_dim != dim`
 - **Flash attention**: Uses flash_attention_2 for efficiency when available
 - **Separate tokenizer**: Supports using the pretrained model's tokenizer
+
+### Partial Encoder Fine-tuning
+
+You can unfreeze the top N layers of the pretrained encoder for task-specific adaptation:
+
+```yaml
+pretrained_encoder:
+  model_name: answerdotai/ModernBERT-base
+  encoder_dim: 768
+  freeze_encoder: true      # Freeze most layers
+  unfreeze_top_layers: 2    # But train the top 2 layers
+```
+
+**Trainable components with this config:**
+| Component | Trainable? |
+|-----------|------------|
+| Bottom encoder layers | Frozen |
+| Top N encoder layers | Trainable |
+| Projection layer (if dim mismatch) | Trainable |
+
+This allows the encoder to adapt its representations to the downstream task while preserving most of the pretrained knowledge.
 
 ### Pretrained Decoder
 
@@ -152,6 +207,29 @@ class CrossAttention(nn.Module):
         # No RoPE applied
         # Apply attention with encoder_mask
 ```
+
+### Cross-Attention Initialization (Recommended)
+
+When using a pretrained decoder, cross-attention layers are randomly initialized since they don't exist in standard causal LM models. For better training dynamics, consider these initialization strategies:
+
+**Strategy 1: Copy Q from Self-Attention**
+```python
+# Q projection operates on the same decoder hidden states
+for layer in decoder.layers:
+    layer.cross_attention.wq.weight.data.copy_(layer.self_attention.wq.weight.data)
+```
+
+**Strategy 2: Zero-Init Output Projection**
+```python
+# Start with minimal cross-attention contribution, gradually learn
+for layer in decoder.layers:
+    nn.init.normal_(layer.cross_attention.wo.weight, std=1e-4)
+```
+
+**Combined approach (recommended):**
+- Copy Q projection from self-attention (same input space)
+- Use small initialization for K/V (different input space - encoder)
+- Near-zero initialization for output projection (gradual integration)
 
 ### Decoder Block Structure
 
@@ -271,6 +349,51 @@ python -m apps.enc_dec.eval \
     config=apps/enc_dec/configs/eval.yaml \
     ckpt_dir=/path/to/checkpoint
 ```
+
+### SQuAD Evaluation
+
+Evaluate on the SQuAD 2.0 dev set with official EM/F1 metrics:
+
+```bash
+# Full evaluation
+python -m apps.enc_dec.eval_squad \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --data_file /path/to/dev-v2.0.json \
+    --output_dir /path/to/results
+
+# Quick test with limited examples
+python -m apps.enc_dec.eval_squad \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --data_file /path/to/dev-v2.0.json \
+    --max_examples 100
+
+# Evaluate on a percentage of the data
+python -m apps.enc_dec.eval_squad \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --data_file /path/to/dev-v2.0.json \
+    --eval_percent 10
+```
+
+**SQuAD Evaluation Options:**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--checkpoint` | Path to consolidated `.pth` file | Required |
+| `--config` | Path to `params.json` config | Required |
+| `--data_file` | Path to SQuAD dev-v2.0.json | Required |
+| `--output_dir` | Directory to save predictions/results | None |
+| `--max_examples` | Limit number of examples | None (all) |
+| `--eval_percent` | Percentage of data to evaluate | 100 |
+| `--max_new_tokens` | Maximum tokens to generate | 64 |
+
+**Output:**
+- Live progress with per-example EM/F1 scores
+- Running average metrics during evaluation
+- Final results: `{"exact": X.X, "f1": X.X, "total": N}`
+- Optional: `predictions.json` and `eval.json` saved to output_dir
 
 ### Inference
 

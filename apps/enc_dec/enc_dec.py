@@ -1,10 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Union, Tuple, List
 
 import torch
+
+logger = logging.getLogger(__name__)
 from torch import nn
 from torch.nn import functional as F
 from xformers.ops import fmha, AttentionBias
@@ -77,13 +80,15 @@ class DecoderArgs:
 class PretrainedEncoderArgs:
     """Arguments for pretrained encoder (e.g., ModernBERT).
 
-    The encoder is loaded from HuggingFace and kept frozen.
+    The encoder is loaded from HuggingFace and can be frozen or partially unfrozen.
     A projection layer maps from encoder_dim to decoder dim if needed.
     """
     model_name: str = "answerdotai/ModernBERT-base"  # HuggingFace model name
     encoder_dim: int = 768  # Hidden dim of the pretrained model
     pooling: str = "none"  # "none" (use all tokens), "mean", "cls"
     use_flash_attention: bool = True  # Use flash attention in ModernBERT if available
+    freeze_encoder: bool = True  # Whether to freeze encoder weights
+    unfreeze_top_layers: int = 0  # Number of top layers to unfreeze (0 = all frozen if freeze_encoder=True)
 
 
 @dataclass
@@ -531,9 +536,19 @@ class Encoder(nn.Module):
         h = self.tok_embeddings(input_ids)
         freq_cis = self.rope_embeddings(seqlen=seqlen)
 
-        # Bidirectional attention - no mask needed
+        # Create encoder self-attention mask from padding mask
+        enc_attn_mask = None
+        if padding_mask is not None and attn_impl == "sdpa":
+            # padding_mask: [B, S] with True for valid tokens, False for padding
+            # Convert to attention mask: [B, 1, 1, S] -> broadcasts to [B, H, S, S]
+            # SDPA expects: 0 for positions to attend, -inf for positions to ignore
+            enc_attn_mask = padding_mask.unsqueeze(1).unsqueeze(2).float()
+            enc_attn_mask = enc_attn_mask.masked_fill(enc_attn_mask == 0, float('-inf'))
+            enc_attn_mask = enc_attn_mask.masked_fill(enc_attn_mask == 1, 0.0)
+
+        # Bidirectional attention with padding mask
         for layer in self.layers:
-            h = layer(h, freq_cis, mask=None, attn_impl=attn_impl)
+            h = layer(h, freq_cis, mask=enc_attn_mask, attn_impl=attn_impl)
 
         return self.norm(h)
 
@@ -598,9 +613,34 @@ class PretrainedEncoder(nn.Module):
             torch_dtype=torch.bfloat16,
         )
 
-        # Freeze all encoder parameters
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        # Handle encoder freezing/unfreezing
+        self.freeze_encoder = pretrained_args.freeze_encoder
+        self.unfreeze_top_layers = pretrained_args.unfreeze_top_layers
+
+        if self.freeze_encoder:
+            # Freeze all encoder parameters first
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+
+            # Unfreeze top N layers if specified
+            if self.unfreeze_top_layers > 0:
+                # Get the encoder layers (works for BERT-style models)
+                if hasattr(self.encoder, 'encoder') and hasattr(self.encoder.encoder, 'layers'):
+                    layers = self.encoder.encoder.layers
+                elif hasattr(self.encoder, 'layers'):
+                    layers = self.encoder.layers
+                else:
+                    logger.warning("Could not find encoder layers to unfreeze")
+                    layers = []
+
+                num_layers = len(layers)
+                layers_to_unfreeze = min(self.unfreeze_top_layers, num_layers)
+
+                for i in range(num_layers - layers_to_unfreeze, num_layers):
+                    for param in layers[i].parameters():
+                        param.requires_grad = True
+
+                logger.info(f"Unfroze top {layers_to_unfreeze} encoder layers")
 
         # Projection layer if dimensions don't match
         self.projection = None
@@ -628,8 +668,18 @@ class PretrainedEncoder(nn.Module):
         if padding_mask is not None:
             attention_mask = padding_mask.long()
 
-        # Run through frozen encoder
-        with torch.no_grad():
+        # Run through encoder
+        # Only use no_grad if ALL encoder parameters are frozen
+        # When unfreeze_top_layers > 0, gradients must flow through those layers
+        if self.freeze_encoder and self.unfreeze_top_layers == 0:
+            with torch.no_grad():
+                outputs = self.encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                hidden_states = outputs.last_hidden_state  # [B, seq, encoder_dim]
+        else:
+            # Allow gradients to flow for unfrozen layers
             outputs = self.encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
