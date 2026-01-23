@@ -589,6 +589,8 @@ class PretrainedEncoder(nn.Module):
         # Enable flash attention if requested and supported
         if self.use_flash_attention:
             config.attn_implementation = "flash_attention_2"
+        # Disable torch.compile to avoid Triton compatibility issues
+        config.reference_compile = False
 
         self.encoder = AutoModel.from_pretrained(
             self.model_name,

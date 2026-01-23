@@ -36,7 +36,14 @@ from typing import Optional, List, Tuple
 import torch
 from omegaconf import OmegaConf
 
-from apps.enc_dec.enc_dec import EncDecTransformer, EncDecTransformerArgs
+from apps.enc_dec.enc_dec import (
+    EncDecTransformer,
+    EncDecTransformerArgs,
+    EncoderArgs,
+    DecoderArgs,
+    PretrainedEncoderArgs,
+    PretrainedDecoderArgs,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +73,19 @@ def load_model_and_tokenizers(
         config_dict = json.load(f)
 
     config = OmegaConf.create(config_dict)
-    model_args = EncDecTransformerArgs(**OmegaConf.to_container(config.model))
+    model_config = OmegaConf.to_container(config.model)
+
+    # Convert nested dicts to dataclass instances
+    if 'encoder' in model_config and isinstance(model_config['encoder'], dict):
+        model_config['encoder'] = EncoderArgs(**model_config['encoder'])
+    if 'decoder' in model_config and isinstance(model_config['decoder'], dict):
+        model_config['decoder'] = DecoderArgs(**model_config['decoder'])
+    if 'pretrained_encoder' in model_config and isinstance(model_config['pretrained_encoder'], dict):
+        model_config['pretrained_encoder'] = PretrainedEncoderArgs(**model_config['pretrained_encoder'])
+    if 'pretrained_decoder' in model_config and isinstance(model_config['pretrained_decoder'], dict):
+        model_config['pretrained_decoder'] = PretrainedDecoderArgs(**model_config['pretrained_decoder'])
+
+    model_args = EncDecTransformerArgs(**model_config)
 
     # Build model
     logger.info("Building model...")
@@ -84,7 +103,8 @@ def load_model_and_tokenizers(
 
     # Load state dict
     model.load_state_dict(state_dict, strict=False)
-    model = model.to(device)
+    # Convert to bfloat16 to match training dtype
+    model = model.to(device=device, dtype=torch.bfloat16)
     model.eval()
     logger.info(f"Model loaded on {device}")
 
@@ -103,7 +123,7 @@ def load_model_and_tokenizers(
     if hasattr(config, 'data') and hasattr(config.data, 'tokenizer'):
         from lingua.tokenizer import build_tokenizer
         logger.info("Loading decoder tokenizer")
-        decoder_tokenizer = build_tokenizer(config.data.tokenizer)
+        decoder_tokenizer = build_tokenizer(config.data.tokenizer.name, config.data.tokenizer.path)
 
     return model, encoder_tokenizer, decoder_tokenizer, config
 

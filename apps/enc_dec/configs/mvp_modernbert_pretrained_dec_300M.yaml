@@ -1,6 +1,6 @@
 name: mvp_modernbert_pretrained_dec_300M
 dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_300M
-max_epochs: 1
+max_epochs: 2
 seed: 42
 grad_acc_steps: 2
 gc_collect_freq: 100
