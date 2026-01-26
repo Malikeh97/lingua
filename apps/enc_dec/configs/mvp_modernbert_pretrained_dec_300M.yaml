@@ -1,13 +1,13 @@
 name: mvp_modernbert_pretrained_dec_300M
 dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_300M
-max_epochs: 2
+max_epochs: 5
 seed: 42
 grad_acc_steps: 2
 gc_collect_freq: 100
 optim:
-  lr: 1e-4
-  weight_decay: 0.01
-  warmup: 200
+  lr: 2e-4 #1e-4
+  weight_decay: 0.1 #0.01
+  warmup: 500 #200
   lr_min_ratio: 0.01
   clip: 1.0
 distributed:
@@ -16,7 +16,7 @@ distributed:
   model_dtype: bf16
   selective_activation_checkpointing: true
 model:
-  # Decoder dimension matches the pretrained 300M model
+  # Decoder dimension matches the 300M architecture
   dim: 960
 
   max_encoder_seqlen: 2048
@@ -34,7 +34,7 @@ model:
     pooling: none
     use_flash_attention: true
     freeze_encoder: true  # Set to false to train full encoder
-    unfreeze_top_layers: 2  # Set to N to unfreeze top N layers (e.g., 2-4)
+    unfreeze_top_layers: 0  # Set to N to unfreeze top N layers (e.g., 2-4)
 
   # Pretrained decoder from HuggingFace
   # Cross-attention layers will be randomly initialized since they don't exist in the HF model

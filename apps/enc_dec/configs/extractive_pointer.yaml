@@ -1,6 +1,6 @@
 name: extractive_pointer_modernbert_300M
 dump_dir: /home/ehghaghi/scratch/ehghaghi/extractive_pointer_modernbert_300M
-max_epochs: 4
+max_epochs: 5
 seed: 42
 grad_acc_steps: 2
 gc_collect_freq: 100

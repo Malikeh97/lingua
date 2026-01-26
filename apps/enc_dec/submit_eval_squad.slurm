@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=eval_squad
-#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/logs/eval_%x_%j.out
-#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/logs/eval_%x_%j.err
+#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT/logs/eval_%x_%j.out
+#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT/logs/eval_%x_%j.err
 #SBATCH --partition=gpubase_l40s_b3
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=8
@@ -44,7 +44,7 @@ mkdir -p $SCRATCH/tmp
 cd /project/aip-craffel/ehghaghi/lingua
 
 # Set checkpoint path
-CKPT_DIR="$SCRATCH/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/checkpoints"
+CKPT_DIR="$SCRATCH/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT/checkpoints"
 LATEST_STEP=$(ls -d ${CKPT_DIR}/0* 2>/dev/null | sort -V | tail -1)
 CONSOLIDATED_CKPT="${LATEST_STEP}/consolidated/consolidated.pth"
 CONFIG_FILE="${LATEST_STEP}/params.json"

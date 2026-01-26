@@ -1,6 +1,6 @@
 name: mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT
 dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT
-max_epochs: 2
+max_epochs: 5
 seed: 42
 grad_acc_steps: 2
 gc_collect_freq: 100

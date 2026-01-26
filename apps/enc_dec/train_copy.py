@@ -74,6 +74,71 @@ from apps.enc_dec.data import (
 logger = logging.getLogger()
 
 
+@torch.no_grad()
+def evaluate_copy_validation(
+    model: EncDecCopyTransformer,
+    dataloader,
+    max_steps: Optional[int] = None,
+) -> Dict[str, float]:
+    """Evaluate copy mechanism model on validation set.
+
+    Args:
+        model: Copy mechanism encoder-decoder model
+        dataloader: Validation dataloader
+        max_steps: Maximum number of steps (None = full validation set)
+
+    Returns:
+        Dictionary with validation metrics:
+        - val_loss: Average negative log-likelihood loss
+        - val_copy_gate_mean: Average copy gate activation
+        - val_steps: Number of validation steps
+    """
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    total_copy_gate = 0.0
+    num_steps = 0
+
+    for batch in dataloader:
+        encoder_input_ids = batch["encoder_input_ids"].cuda()
+        decoder_input_ids = batch["decoder_input_ids"].cuda()
+        labels = batch["labels"].cuda()
+        encoder_mask = batch["encoder_padding_mask"].cuda()
+
+        # Forward pass returns (loss, aux_dict)
+        loss, aux = model(
+            encoder_input_ids=encoder_input_ids,
+            decoder_input_ids=decoder_input_ids,
+            decoder_target=labels,
+            encoder_padding_mask=encoder_mask,
+        )
+
+        # Accumulate loss weighted by number of valid tokens
+        valid_mask = (labels != -100)
+        num_tokens = valid_mask.sum().item()
+        total_loss += loss.item() * num_tokens
+        total_tokens += num_tokens
+
+        # Accumulate copy gate stats
+        total_copy_gate += aux.get("copy_gate_mean", 0.0)
+
+        num_steps += 1
+
+        if max_steps is not None and num_steps >= max_steps:
+            break
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    avg_copy_gate = total_copy_gate / max(num_steps, 1)
+    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+
+    return {
+        "val_loss": avg_loss,
+        "val_perplexity": perplexity,
+        "val_copy_gate_mean": avg_copy_gate,
+        "val_steps": num_steps,
+    }
+
+
 @dataclass
 class EvalArgs:
     """Evaluation configuration."""
@@ -448,6 +513,27 @@ def train(args: CopyTrainArgs):
                     f"  copy_gate: {aux.get('copy_gate_mean', 0):.3f}"
                     f"  grad: {grad_norm:.2e}"
                     f"  lr: {curr_lr:.2e}"
+                )
+
+            # Validation evaluation
+            if val_loader is not None and every_n_steps(train_state, args.eval.every, acc_step=0):
+                logger.info(f"Running validation at step {train_state.step}...")
+                val_metrics = evaluate_copy_validation(
+                    model, val_loader, max_steps=args.eval.max_steps
+                )
+                model.train()  # Switch back to training mode
+
+                # Log validation metrics
+                val_metrics_flat = {f"eval/{k}": v for k, v in val_metrics.items()}
+                val_metrics_flat["global_step"] = train_state.step
+                if get_is_master():
+                    metric_logger.log(val_metrics_flat)
+
+                logger.info(
+                    f"Validation: step={train_state.step}"
+                    f"  val_loss={val_metrics['val_loss']:.4f}"
+                    f"  val_ppl={val_metrics['val_perplexity']:.2f}"
+                    f"  val_copy_gate={val_metrics['val_copy_gate_mean']:.3f}"
                 )
 
             # Checkpointing

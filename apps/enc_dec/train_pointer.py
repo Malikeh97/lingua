@@ -75,6 +75,69 @@ from apps.enc_dec.data import (
 logger = logging.getLogger()
 
 
+@torch.no_grad()
+def evaluate_pointer_validation(
+    model: EncDecPointerTransformer,
+    dataloader,
+    max_steps: Optional[int] = None,
+) -> Dict[str, float]:
+    """Evaluate pointer model on validation set.
+
+    Args:
+        model: Pointer mechanism encoder-decoder model
+        dataloader: Validation dataloader
+        max_steps: Maximum number of steps (None = full validation set)
+
+    Returns:
+        Dictionary with validation metrics:
+        - val_loss: Average cross-entropy loss over positions
+        - val_accuracy: Average pointer accuracy
+        - val_steps: Number of validation steps
+    """
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_valid = 0
+    num_steps = 0
+
+    for batch in dataloader:
+        encoder_input_ids = batch["encoder_input_ids"].cuda()
+        decoder_input_ids = batch["decoder_input_ids"].cuda()
+        target_positions = batch["target_positions"].cuda()
+        encoder_mask = batch["encoder_padding_mask"].cuda()
+
+        # Forward pass returns (loss, aux_dict)
+        loss, aux = model(
+            encoder_input_ids=encoder_input_ids,
+            decoder_input_ids=decoder_input_ids,
+            target_positions=target_positions,
+            encoder_padding_mask=encoder_mask,
+        )
+
+        # Accumulate loss
+        valid_mask = (target_positions != -100)
+        num_valid = valid_mask.sum().item()
+        total_loss += loss.item() * num_valid
+        total_valid += num_valid
+
+        # Accumulate accuracy
+        total_correct += aux.get("pointer_accuracy", 0.0) * num_valid
+
+        num_steps += 1
+
+        if max_steps is not None and num_steps >= max_steps:
+            break
+
+    avg_loss = total_loss / max(total_valid, 1)
+    avg_accuracy = total_correct / max(total_valid, 1)
+
+    return {
+        "val_loss": avg_loss,
+        "val_accuracy": avg_accuracy,
+        "val_steps": num_steps,
+    }
+
+
 @dataclass
 class EvalArgs:
     """Evaluation configuration."""
@@ -449,6 +512,26 @@ def train(args: PointerTrainArgs):
                     f"  ptr_acc: {aux.get('pointer_accuracy', 0):.3f}"
                     f"  grad: {grad_norm:.2e}"
                     f"  lr: {curr_lr:.2e}"
+                )
+
+            # Validation evaluation
+            if val_loader is not None and every_n_steps(train_state, args.eval.every, acc_step=0):
+                logger.info(f"Running validation at step {train_state.step}...")
+                val_metrics = evaluate_pointer_validation(
+                    model, val_loader, max_steps=args.eval.max_steps
+                )
+                model.train()  # Switch back to training mode
+
+                # Log validation metrics
+                val_metrics_flat = {f"eval/{k}": v for k, v in val_metrics.items()}
+                val_metrics_flat["global_step"] = train_state.step
+                if get_is_master():
+                    metric_logger.log(val_metrics_flat)
+
+                logger.info(
+                    f"Validation: step={train_state.step}"
+                    f"  val_loss={val_metrics['val_loss']:.4f}"
+                    f"  val_acc={val_metrics['val_accuracy']:.4f}"
                 )
 
             # Checkpointing
