@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers
-#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/logs/%x_%j.out
-#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/logs/%x_%j.err
+#SBATCH --job-name=extractive_copy_modernbert_300M
+#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/extractive_copy_modernbert_300M/logs/%x_%j.out
+#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/extractive_copy_modernbert_300M/logs/%x_%j.err
 #SBATCH --partition=gpubase_l40s_b3
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=16
@@ -28,10 +28,9 @@ source /home/ehghaghi/scratch/ehghaghi/envs/lingua_env/bin/activate
 export SCRATCH="/home/ehghaghi/scratch/ehghaghi"
 export HF_HOME="$SCRATCH/.cache/huggingface"
 export HF_HUB_CACHE="$HF_HOME/hub"
-export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE" 
+export HUGGINGFACE_HUB_CACHE="$HF_HUB_CACHE"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export XDG_CACHE_HOME="$SCRATCH/.cache"
-
 
 export TMPDIR="$SCRATCH/tmp"
 export TRITON_CACHE_DIR="$TMPDIR/triton"
@@ -42,7 +41,7 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_DEBUG=INFO
 
 # Create directories
-mkdir -p $SCRATCH/mvp_modernbert/logs
+mkdir -p $SCRATCH/extractive_copy_modernbert_300M/logs
 mkdir -p "$HF_HOME" "$HF_HUB_CACHE" "$HF_DATASETS_CACHE"
 mkdir -p $SCRATCH/tmp
 mkdir -p $SCRATCH/tmp/triton
@@ -51,11 +50,11 @@ mkdir -p $SCRATCH/tmp/torch_extensions
 cd /project/aip-craffel/ehghaghi/lingua
 
 echo "============================================"
-echo "MVP: Frozen ModernBERT encoder + trainable decoder"
-echo "Config: apps/enc_dec/configs/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers.yaml"
+echo "Copy Mechanism: Extractive QA with ModernBERT encoder"
+echo "Config: apps/enc_dec/configs/extractive_copy.yaml"
 echo "============================================"
 
-# Pre-download ModernBERT model (optional, helps with logging)
+# Pre-download ModernBERT model
 echo "Checking ModernBERT model availability..."
 python -c "from transformers import AutoModel, AutoTokenizer; AutoTokenizer.from_pretrained('answerdotai/ModernBERT-base'); print('ModernBERT tokenizer ready')" 2>/dev/null || echo "Will download during training"
 
@@ -63,11 +62,11 @@ echo "============================================"
 echo "Starting training at $(date)"
 echo "============================================"
 
-# Run training
+# Run training with copy mechanism
 torchrun --nproc-per-node 1 \
     --master-port 29500 \
-    -m apps.enc_dec.train \
-    config=apps/enc_dec/configs/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers.yaml
+    -m apps.enc_dec.train_copy \
+    config=apps/enc_dec/configs/extractive_copy.yaml
 
 echo "============================================"
 echo "Job finished at $(date)"

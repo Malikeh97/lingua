@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=eval_squad
-#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/logs/eval_%x_%j.out
-#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/logs/eval_%x_%j.err
+#SBATCH --job-name=eval_copy
+#SBATCH --output=/home/ehghaghi/scratch/ehghaghi/extractive_copy_modernbert_300M/logs/eval_%x_%j.out
+#SBATCH --error=/home/ehghaghi/scratch/ehghaghi/extractive_copy_modernbert_300M/logs/eval_%x_%j.err
 #SBATCH --partition=gpubase_l40s_b3
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=8
@@ -43,8 +43,8 @@ mkdir -p $SCRATCH/tmp
 
 cd /project/aip-craffel/ehghaghi/lingua
 
-# Set checkpoint path
-CKPT_DIR="$SCRATCH/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers/checkpoints"
+# Set checkpoint path - UPDATE THIS TO YOUR COPY MODEL CHECKPOINT
+CKPT_DIR="$SCRATCH/extractive_copy_modernbert_300M/checkpoints"
 LATEST_STEP=$(ls -d ${CKPT_DIR}/0* 2>/dev/null | sort -V | tail -1)
 CONSOLIDATED_CKPT="${LATEST_STEP}/consolidated/consolidated.pth"
 CONFIG_FILE="${LATEST_STEP}/params.json"
@@ -53,13 +53,16 @@ CONFIG_FILE="${LATEST_STEP}/params.json"
 SQUAD_DEV_FILE="/home/ehghaghi/projects/aip-craffel/ehghaghi/lingua/apps/enc_dec/data/dev-v2.0.json"
 
 # Output directory for results
-OUTPUT_DIR="$SCRATCH/mvp_modernbert_pretrained_dec_300M/eval_results/$(basename $LATEST_STEP)"
+OUTPUT_DIR="$SCRATCH/extractive_copy_modernbert_300M/eval_results/$(basename $LATEST_STEP)"
 
 # Percentage of dev data to evaluate (1-100)
 EVAL_PERCENT=100
 
+# Create log directory if it doesn't exist
+mkdir -p "$SCRATCH/extractive_copy_modernbert_300M/logs"
+
 echo "============================================"
-echo "Running SQuAD Evaluation"
+echo "Running Copy Mechanism SQuAD Evaluation"
 echo "Checkpoint: $CONSOLIDATED_CKPT"
 echo "Config: $CONFIG_FILE"
 echo "SQuAD Dev File: $SQUAD_DEV_FILE"
@@ -68,7 +71,7 @@ echo "Eval Percent: $EVAL_PERCENT%"
 echo "============================================"
 
 # Run evaluation on SQuAD dev set
-python -u -m apps.enc_dec.eval_squad \
+python -u -m apps.enc_dec.eval_squad_copy \
     --checkpoint "$CONSOLIDATED_CKPT" \
     --config "$CONFIG_FILE" \
     --data_file "$SQUAD_DEV_FILE" \
