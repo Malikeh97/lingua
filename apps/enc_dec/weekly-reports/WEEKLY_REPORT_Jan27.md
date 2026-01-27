@@ -97,17 +97,17 @@ Performance Gain (Pointer vs. Standard Frozen Enc baseline):
 
 | Pointer (Frozen Enc) | Copy (Frozen Enc) |
 |:---:|:---:|
-| ![Pointer Training](../plots/training_loss_curve_modernbert_300M_pointer_5epochs.png) | ![Copy Training](plots/training_loss_curve_modernbert_300M_copy_5epochs.png) |
+| ![Pointer Training](../plots/training_loss_curve_modernbert_300M_pointer_5epochs.png) | ![Copy Training](../plots/training_loss_curve_modernbert_300M_copy_5epochs.png) |
 
 | Standard (Last 2L Unfrozen) | Standard (Frozen Enc) |
 |:---:|:---:|
-| ![Standard 2L Training](../plots/training_loss_curve_modernbert_300M_2layers_4epochs.png) | ![Standard Frozen Training](plots/training_loss_mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_5epochs.png) |
+| ![Standard 2L Training](../plots/training_loss_curve_modernbert_300M_2layers_4epochs.png) | ![Standard Frozen Training](../plots/training_loss_mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_5epochs.png) |
 
 ### Training vs. Validation Loss
 
 | Pointer (Frozen Enc) | Copy (Frozen Enc) |
 |:---:|:---:|
-| ![Pointer Val](../plots/training_vs_validation_loss_curve_modernbert_300M_pointer_5epochs.png) | ![Copy Val](plots/training_vs_validation_loss_curve_modernbert_300M_copy_5epochs.png) |
+| ![Pointer Val](../plots/training_vs_validation_loss_curve_modernbert_300M_pointer_5epochs.png) | ![Copy Val](../plots/training_vs_validation_loss_curve_modernbert_300M_copy_5epochs.png) |
 
 | Standard (Last 2L Unfrozen) | Standard (Frozen Enc) |
 |:---:|:---:|
