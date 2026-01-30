@@ -61,14 +61,16 @@ Output is guaranteed to be verbatim from source - no vocabulary bottleneck.
 
 ### Performance Metrics
 
-| Model | Encoder | Decoder | EM (%) | F1 (%) |
-|-------|---------|---------|-------:|-------:|
-| **Pointer** | Frozen | From scratch | **15.52** | **28.70** |
-| Pointer | Frozen | From scratch | 15.01 | 28.36 |
-| Copy | Frozen | From scratch | 6.92 | 12.65 |
-| Copy | Frozen | From scratch | 6.51 | 12.49 |
-| Standard | Last 2L unfrozen | From scratch | 6.12 | 12.48 |
-| Standard | Frozen | From scratch | 6.31 | 12.09 |
+| Model | Encoder | Decoder | EM (%) | F1 (%) | Cross-Attention Init |
+|-------|---------|---------|-------:|-------:||-------:|
+| **Pointer** | Frozen | From scratch | **15.52** | **28.70** | Random |
+| Pointer | Frozen | From scratch | 15.01 | 28.36 | Random |
+| Copy | Frozen | From scratch | 6.92 | 12.65 | Random |
+| Copy | Frozen | From scratch | 6.51 | 12.49 | Random |
+| Standard | Frozen |From scratch | 8.97 |16.49 | Copy |
+| Standard | Frozen | From Pretrained | 8.33 | 15.67 | Random |
+| Standard | Last 2L unfrozen | From scratch | 6.12 | 12.48 | Random |
+| Standard | Frozen | From scratch | 6.31 | 12.09 | Random |
 
 *Top rows: 5 epochs, bottom rows within each mechanism: 4 epochs*
 
