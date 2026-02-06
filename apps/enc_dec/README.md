@@ -2,11 +2,89 @@
 
 This app implements an encoder-decoder transformer architecture with cross-attention for question answering tasks, compatible with HuggingFace datasets.
 
+## Installation
+
+### Quick Start with uv (Recommended)
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package manager that provides reproducible installs.
+
+**Local Development:**
+```bash
+cd apps/enc_dec
+
+# Quick install (creates .venv and installs dependencies)
+./scripts/install_uv.sh
+
+# Activate
+source .venv/bin/activate
+```
+
+**Compute Canada HPC:**
+```bash
+cd apps/enc_dec
+
+# Full setup with CUDA support
+./scripts/setup_cc.sh
+
+# Activate (add to SLURM scripts)
+module load python/3.11 cuda/12.2 cudnn/8.9 arrow/17
+source $SCRATCH/envs/lingua_uv/bin/activate
+```
+
+### Manual Installation
+
+If you prefer manual setup:
+
+```bash
+# Install uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create environment
+uv venv .venv --python 3.11
+source .venv/bin/activate
+
+# Install PyTorch with CUDA
+uv pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Install project
+uv pip install -e .
+```
+
+### Verify Installation
+
+```bash
+python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+python -c "import transformers; print(f'Transformers {transformers.__version__}')"
+```
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `pyproject.toml` | Project dependencies and metadata |
+| `requirements-core.txt` | Direct dependencies (clean list) |
+| `scripts/setup_cc.sh` | Compute Canada setup script |
+| `scripts/install_uv.sh` | Quick local install script |
+| `slurm/template_uv.slurm` | SLURM template using uv environment |
+
 ## Overview
 
 The encoder-decoder architecture processes:
 - **Encoder**: Gold document/context (bidirectional attention)
 - **Decoder**: Question + Answer generation with cross-attention to encoder output
+
+### Output Mechanisms
+
+Four output mechanisms are supported for different use cases:
+
+| Mechanism | Description | Best For | Expected SQuAD EM |
+|-----------|-------------|----------|-------------------|
+| **Standard** | Next-token prediction from vocabulary | Abstractive QA, general generation | ~20-30% |
+| **Copy** | Blends generation with copying from input | Mixed extractive/abstractive | ~25-35% |
+| **Pointer** | Autoregressively points to encoder positions | Pure extraction (token-by-token) | ~15% |
+| **Span Pointer** | Predicts start/end positions in single pass | Pure extraction (BERT-style) | ~50-70% |
+
+See [docs/](docs/) for detailed documentation on each mechanism.
 
 ### Encoder Types
 
@@ -23,26 +101,80 @@ Three encoder modes are supported:
 ```
 apps/enc_dec/
 ├── __init__.py                 # Package init
-├── enc_dec.py                  # Model architecture
-├── data.py                     # QA data loader for HuggingFace datasets
-├── train.py                    # Training script
-├── eval.py                     # Evaluation script
-├── eval_squad.py               # SQuAD 2.0 evaluation with official EM/F1 metrics
-├── export_checkpoint.py        # Checkpoint consolidation/export script
-├── infer.py                    # Inference script for QA generation
 ├── README.md                   # This file
 ├── MVP_GUIDE.txt               # Step-by-step guide for MVP testing
-├── submit_smoke_test.slurm     # SLURM script for smoke test
-├── submit_mvp_modernbert.slurm # SLURM script for MVP with ModernBERT
-├── submit_eval_squad.slurm     # SLURM script for SQuAD evaluation
+│
+├── # Core Architecture
+├── enc_dec.py                  # Standard encoder-decoder model
+├── enc_dec_copy.py             # Copy mechanism model
+├── enc_dec_pointer.py          # Autoregressive pointer model
+├── enc_dec_span_pointer.py     # Span pointer model (BERT-style)
+│
+├── # Data Loaders
+├── data.py                     # Standard QA data loader
+├── data_pointer.py             # Pointer mechanism data (position targets)
+├── data_span_pointer.py        # Span pointer data (start/end targets)
+│
+├── # Training Scripts
+├── train.py                    # Standard training
+├── train_copy.py               # Copy mechanism training
+├── train_pointer.py            # Pointer mechanism training
+├── train_span_pointer.py       # Span pointer training
+│
+├── # Evaluation Scripts
+├── eval.py                     # General evaluation
+├── eval_squad.py               # SQuAD eval for standard model
+├── eval_squad_copy.py          # SQuAD eval for copy mechanism
+├── eval_squad_pointer.py       # SQuAD eval for pointer mechanism
+├── eval_squad_span_pointer.py  # SQuAD eval for span pointer
+│
+├── # Inference Scripts
+├── infer.py                    # Standard inference
+├── infer_copy.py               # Copy mechanism inference
+├── infer_pointer.py            # Pointer mechanism inference
+├── infer_span_pointer.py       # Span pointer inference
+│
+├── # Utilities
+├── export_checkpoint.py        # Checkpoint consolidation/export
+│
+├── # SLURM Scripts
+├── submit_mvp_modernbert_300M.slurm          # Training with pretrained decoder
+├── submit_eval_squad.slurm                   # Standard SQuAD evaluation
+├── submit_extractive_copy.slurm              # Copy mechanism training
+├── submit_extractive_pointer.slurm           # Pointer mechanism training
+├── submit_extractive_span_pointer.slurm      # Span pointer training
+├── submit_eval_copy.slurm                    # Copy mechanism evaluation
+├── submit_eval_pointer.slurm                 # Pointer mechanism evaluation
+├── submit_eval_span_pointer.slurm            # Span pointer evaluation
+├── submit_infer_copy.slurm                   # Copy mechanism inference
+├── submit_infer_pointer.slurm                # Pointer mechanism inference
+├── submit_infer_span_pointer.slurm           # Span pointer inference
+├── submit_infer_modernbert_300M.slurm        # Standard inference
+├── submit_infer_custom.slurm                 # Custom inference template
+│
+├── # Documentation
+├── docs/
+│   ├── architecture_diagrams.md
+│   ├── copy_mechanism.md
+│   ├── pointer_mechanism.md
+│   ├── span_pointer_mechanism.md
+│   └── training_mechanism.md
+│
+├── # Weekly Reports
+├── weekly-reports/
+│   └── WEEKLY_REPORT_Jan27.md
+│
 └── configs/
-    ├── debug.yaml                          # Small model for debugging
-    ├── enc_dec_base.yaml                   # Base configuration
-    ├── smoke_test_1b.yaml                  # 1.3B model smoke test
-    ├── mvp_modernbert.yaml                 # MVP: Frozen ModernBERT + trainable decoder
-    ├── mvp_modernbert_base_300M.yaml       # Frozen ModernBERT + 300M trainable decoder
-    ├── mvp_modernbert_pretrained_dec_300M.yaml  # Frozen ModernBERT + pretrained 300M decoder
-    └── mvp_embedding_only.yaml             # MVP: Embedding-only encoder (quick debug)
+    ├── debug.yaml                                              # Small model for debugging
+    ├── enc_dec_base.yaml                                       # Base configuration
+    ├── mvp_modernbert_base_300M.yaml                           # Frozen ModernBERT + 300M decoder
+    ├── mvp_modernbert_pretrained_dec_300M.yaml                 # Frozen ModernBERT + pretrained 300M decoder
+    ├── mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT.yaml # Frozen encoder variants
+    ├── mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_2layers.yaml
+    ├── mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_4layers.yaml
+    ├── extractive_copy.yaml                                    # Copy mechanism config
+    ├── extractive_pointer.yaml                                 # Pointer mechanism config
+    └── extractive_span_pointer.yaml                            # Span pointer config (recommended)
 ```
 
 ## Trainable Components
@@ -110,6 +242,17 @@ class EncDecTransformerArgs:
 | `Decoder` | Embedding + decoder blocks + output projection |
 | `EncDecTransformer` | Combined model with encoder type selection |
 
+**Extractive Mechanism Components:**
+
+| Class | Description |
+|-------|-------------|
+| `SpanPointerDecoder` | Predicts start/end positions for span extraction |
+| `EncDecSpanPointerTransformer` | Encoder-decoder with span pointer mechanism |
+| `CopyDecoder` | Blends generation with copying from encoder |
+| `EncDecCopyTransformer` | Encoder-decoder with copy mechanism |
+| `PointerDecoder` | Autoregressive pointer to encoder positions |
+| `EncDecPointerTransformer` | Encoder-decoder with pointer mechanism |
+
 ### Pretrained Encoder (ModernBERT)
 
 The `PretrainedEncoder` class enables using frozen pretrained models:
@@ -162,11 +305,12 @@ The `PretrainedDecoderArgs` class enables initializing the decoder from a Huggin
 class PretrainedDecoderArgs:
     model_name: str = ""           # HuggingFace model name/path (empty = no pretrained)
     freeze_pretrained: bool = False  # Whether to freeze loaded weights
+    init_mode: str = "none"        # Cross-attention init: "none", "copy", "zero", "normal"
 ```
 
 Features:
 - **Partial weight loading**: Loads matching weights (embeddings, self-attention, FFN, norms) from the HF model
-- **Cross-attention initialization**: Cross-attention layers are randomly initialized since they don't exist in standard causal LM models
+- **Cross-attention initialization**: Cross-attention layers can be initialized from self-attention weights using `init_mode`
 - **Optional freezing**: Can freeze pretrained weights while keeping cross-attention trainable
 - **Architecture matching**: Decoder config (`n_layers`, `n_heads`, etc.) must match the pretrained model
 
@@ -186,8 +330,8 @@ Weight Mapping (LLaMA-style HF model -> enc_dec decoder):
 | `model.layers.{i}.post_attention_layernorm` | `decoder.layers.{i}.ffn_norm` |
 | `model.norm` | `decoder.norm` |
 | `lm_head.weight` | `decoder.output.weight` |
-| N/A (randomly initialized) | `decoder.layers.{i}.cross_attention.*` |
-| N/A (randomly initialized) | `decoder.layers.{i}.cross_attention_norm` |
+| Depends on `init_mode` | `decoder.layers.{i}.cross_attention.*` |
+| Depends on `init_mode` | `decoder.layers.{i}.cross_attention_norm` |
 
 ### Cross-Attention Implementation
 
@@ -208,28 +352,36 @@ class CrossAttention(nn.Module):
         # Apply attention with encoder_mask
 ```
 
-### Cross-Attention Initialization (Recommended)
+### Cross-Attention Initialization
 
-When using a pretrained decoder, cross-attention layers are randomly initialized since they don't exist in standard causal LM models. For better training dynamics, consider these initialization strategies:
+When using a pretrained decoder, cross-attention layers don't exist in standard causal LM models. The `init_mode` parameter controls how they are initialized:
 
-**Strategy 1: Copy Q from Self-Attention**
-```python
-# Q projection operates on the same decoder hidden states
-for layer in decoder.layers:
-    layer.cross_attention.wq.weight.data.copy_(layer.self_attention.wq.weight.data)
+| Mode | Q, K, V Projections | O Projection | LayerNorm | Use Case |
+|------|---------------------|--------------|-----------|----------|
+| `none` | Random (truncated normal) | Random | Random | Baseline |
+| `copy` | Copy from self-attention | Copy from self-attention | Copy from ffn_norm | Best for training stability |
+| `zero` | Copy from self-attention | Zero-initialized | Copy from ffn_norm | Gradual integration |
+| `normal` | Copy from self-attention | Kaiming normal | Copy from ffn_norm | Alternative initialization |
+
+**Configuration:**
+```yaml
+pretrained_decoder:
+  model_name: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
+  freeze_pretrained: false
+  init_mode: copy  # Recommended for better training dynamics
 ```
 
-**Strategy 2: Zero-Init Output Projection**
-```python
-# Start with minimal cross-attention contribution, gradually learn
-for layer in decoder.layers:
-    nn.init.normal_(layer.cross_attention.wo.weight, std=1e-4)
-```
+**How it works:**
+- **Q projection**: Copied from self-attention (operates on same decoder hidden states)
+- **K, V projections**: Copied from self-attention with dimension slicing if needed
+- **O projection**: Based on mode - copy, zero, or kaiming_normal initialization
+- **LayerNorm**: Copied from `ffn_norm` (corresponds to HF's `post_attention_layernorm`)
 
-**Combined approach (recommended):**
-- Copy Q projection from self-attention (same input space)
-- Use small initialization for K/V (different input space - encoder)
-- Near-zero initialization for output projection (gradual integration)
+**Logs will show:**
+```
+Initializing cross-attention weights from self-attention (mode: copy)
+Initialized 20,000,000 cross-attention parameters from self-attention
+```
 
 ### Decoder Block Structure
 
@@ -437,6 +589,90 @@ python -m apps.enc_dec.infer \
 | `--top_p` | Nucleus sampling | None |
 | `--device` | Device (cuda/cpu) | cuda |
 
+## Extractive Mechanisms
+
+For extractive QA where answers must be spans from the input context, we provide three specialized mechanisms. The **Span Pointer** mechanism is recommended for best performance.
+
+### Span Pointer (Recommended)
+
+BERT-style single-pass span extraction. Predicts start and end positions in one forward pass.
+
+**Training:**
+```bash
+# Single GPU
+torchrun --nproc-per-node 1 \
+    -m apps.enc_dec.train_span_pointer \
+    config=apps/enc_dec/configs/extractive_span_pointer.yaml
+
+# SLURM
+sbatch apps/enc_dec/submit_extractive_span_pointer.slurm
+```
+
+**Evaluation:**
+```bash
+python -m apps.enc_dec.eval_squad_span_pointer \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --data_file /path/to/dev-v2.0.json \
+    --output_dir /path/to/results \
+    --max_span_length 50
+```
+
+**Inference:**
+```bash
+python -m apps.enc_dec.infer_span_pointer \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --num_examples 10 \
+    --visualize
+```
+
+### Copy Mechanism
+
+Blends vocabulary generation with copying from encoder input.
+
+**Training:**
+```bash
+torchrun --nproc-per-node 1 \
+    -m apps.enc_dec.train_copy \
+    config=apps/enc_dec/configs/extractive_copy.yaml
+```
+
+**Evaluation:**
+```bash
+python -m apps.enc_dec.eval_squad_copy \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --data_file /path/to/dev-v2.0.json
+```
+
+### Pointer Mechanism
+
+Autoregressive pointing to encoder positions (token-by-token).
+
+**Training:**
+```bash
+torchrun --nproc-per-node 1 \
+    -m apps.enc_dec.train_pointer \
+    config=apps/enc_dec/configs/extractive_pointer.yaml
+```
+
+**Evaluation:**
+```bash
+python -m apps.enc_dec.eval_squad_pointer \
+    --checkpoint /path/to/consolidated.pth \
+    --config /path/to/params.json \
+    --data_file /path/to/dev-v2.0.json
+```
+
+### Mechanism Comparison
+
+| Mechanism | Forward Passes | Output Guarantee | SQuAD EM | Use Case |
+|-----------|----------------|------------------|----------|----------|
+| Span Pointer | 1 | Contiguous span | ~50-70% | Best for extractive QA |
+| Copy | N (autoregressive) | Tokens from vocab or input | ~25-35% | Mixed extractive/abstractive |
+| Pointer | N (autoregressive) | Positions in input | ~15% | Pure extraction (experimental) |
+
 ### Configuration Override
 
 Use dot notation to override nested parameters:
@@ -474,7 +710,7 @@ data:
 
 ### Pretrained Encoder + Pretrained Decoder (mvp_modernbert_pretrained_dec_300M.yaml)
 
-This configuration uses both a frozen pretrained encoder (ModernBERT) and initializes the decoder from a pretrained HuggingFace causal LM model. Cross-attention layers are randomly initialized.
+This configuration uses both a frozen pretrained encoder (ModernBERT) and initializes the decoder from a pretrained HuggingFace causal LM model. Cross-attention layers are initialized from self-attention weights using `init_mode: copy`.
 
 ```yaml
 model:
@@ -488,6 +724,7 @@ model:
   pretrained_decoder:
     model_name: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
     freeze_pretrained: false  # All weights trainable
+    init_mode: copy  # Initialize cross-attention from self-attention weights
   decoder:
     # Architecture must match the pretrained model
     n_layers: 32
@@ -510,7 +747,64 @@ python -m apps.enc_dec.train config=apps/enc_dec/configs/mvp_modernbert_pretrain
 ```
 Loading pretrained decoder weights from: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
 Loaded 280,000,000 parameters from pretrained model
-Randomly initialized 20,000,000 parameters (cross-attention)
+Initializing cross-attention weights from self-attention (mode: copy)
+Initialized 20,000,000 cross-attention parameters from self-attention
+```
+
+### Span Pointer for Extractive QA (extractive_span_pointer.yaml)
+
+This configuration uses the span pointer mechanism for BERT-style extractive QA. The decoder predicts start and end positions in the encoder output instead of generating tokens.
+
+```yaml
+name: extractive_span_pointer_pretrained_dec_300M
+
+model:
+  dim: 960
+  encoder_type: pretrained
+
+  pretrained_encoder:
+    model_name: answerdotai/ModernBERT-base
+    encoder_dim: 768
+    freeze_encoder: true
+    unfreeze_top_layers: 0  # Fully frozen
+
+  pretrained_decoder:
+    model_name: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
+    freeze_pretrained: false  # Fine-tune for span prediction
+    init_mode: copy  # Initialize cross-attention from self-attention weights
+
+  decoder:
+    n_layers: 32
+    n_heads: 15
+    n_kv_heads: 5
+    rope_theta: 100000.0
+
+# Span pointer mechanism configuration
+span_pointer:
+  use_projection: true
+  projection_dim: null  # Use model dim (960)
+  condition_end_on_start: false  # Independent start/end prediction
+  question_pooling: last  # Use last token for question representation
+  max_span_length: 50  # Maximum answer span length
+
+data:
+  dataset_name: squad
+  max_encoder_len: 1024
+  max_decoder_len: 128  # Just question (no answer tokens needed)
+  batch_size: 8
+```
+
+**Key differences from standard encoder-decoder:**
+- `span_pointer` section configures the span prediction mechanism
+- Decoder outputs start/end logits instead of vocabulary logits
+- Training uses (start_position, end_position) targets instead of token sequences
+- Single forward pass for inference
+
+**Usage:**
+```bash
+torchrun --nproc-per-node 1 \
+    -m apps.enc_dec.train_span_pointer \
+    config=apps/enc_dec/configs/extractive_span_pointer.yaml
 ```
 
 ### Embedding-Only Encoder (mvp_embedding_only.yaml)
@@ -574,6 +868,7 @@ The design enables various ablations:
 | Pretrained encoder | `model.pretrained_encoder.model_name` |
 | Pretrained decoder | `model.pretrained_decoder.model_name` |
 | Freeze pretrained decoder | `model.pretrained_decoder.freeze_pretrained` |
+| Cross-attention init | `model.pretrained_decoder.init_mode` |
 | Pooling strategy | `model.pretrained_encoder.pooling` |
 
 ## Supported Pretrained Encoders
@@ -611,6 +906,7 @@ Supports:
 - **Mixed precision**: `distributed.model_dtype: bf16`
 - **Activation checkpointing**: `distributed.selective_activation_checkpointing: true`
 - **Frozen encoder handling**: Pretrained encoder excluded from FSDP sharding
+- **Single-GPU mode**: Automatic FSDP bypass for single-GPU with `no_shard` (PyTorch 2.7+ compatibility)
 
 ## Checkpoint Consolidation
 
@@ -691,16 +987,41 @@ Frozen parameters: 149,000,000      # Pretrained encoder
 - OmegaConf (for configuration)
 - flash-attn (optional, for faster attention)
 
+## Documentation
+
+Detailed documentation for each mechanism is available in the `docs/` directory:
+
+| Document | Description |
+|----------|-------------|
+| [docs/span_pointer_mechanism.md](docs/span_pointer_mechanism.md) | Span pointer (BERT-style) for extractive QA |
+| [docs/pointer_mechanism.md](docs/pointer_mechanism.md) | Autoregressive pointer mechanism |
+| [docs/copy_mechanism.md](docs/copy_mechanism.md) | Copy mechanism with generation blend |
+| [docs/architecture_diagrams.md](docs/architecture_diagrams.md) | Visual architecture diagrams |
+| [docs/training_mechanism.md](docs/training_mechanism.md) | Training details and tips |
+
 ## Future Work
 
 - [ ] Subquadratic cross-attention (linear attention variants)
 - [ ] KV cache for encoder output during generation
 - [ ] Multi-document batching/packing
 - [ ] Tensor Parallelism support
+- [x] Span pointer mechanism for BERT-style extractive QA
+- [x] Pretrained decoder support with cross-attention initialization
+- [x] Copy and pointer mechanisms for extractive QA
 
 ## References
 
+**Framework:**
 - Based on lingua framework patterns from `apps/main/`
 - Cross-attention follows standard encoder-decoder transformer design
 - Compatible with HuggingFace QA datasets (SQuAD, Natural Questions, etc.)
+
+**Pretrained Models:**
 - ModernBERT: https://huggingface.co/answerdotai/ModernBERT-base
+- Nemotron 300M: https://huggingface.co/Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
+
+**Papers:**
+- [BERT for Question Answering](https://arxiv.org/abs/1810.04805) - Devlin et al., 2018
+- [Pointer Networks](https://arxiv.org/abs/1506.03134) - Vinyals et al., 2015
+- [Get To The Point: Summarization with Pointer-Generator Networks](https://arxiv.org/abs/1704.04368) - See et al., 2017
+- [SQuAD: 100,000+ Questions for Machine Comprehension](https://arxiv.org/abs/1606.05250) - Rajpurkar et al., 2016
