@@ -22,6 +22,10 @@ env/
 venv/
 ENV/
 
+# uv
+uv.lock
+.uv/
+
 # Editors and IDEs
 .idea/  # pycharm
 .vscode/ # VS Code (often ignored via global gitignore)

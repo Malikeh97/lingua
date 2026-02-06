@@ -1,0 +1,90 @@
+[project]
+name = "enc-dec"
+version = "0.1.0"
+description = "Encoder-Decoder Transformer for Question Answering"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Malikeh Ehghaghi" }
+]
+
+dependencies = [
+    # Core ML frameworks
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "datasets>=2.18.0",
+    "accelerate>=0.28.0",
+    "safetensors>=0.4.0",
+
+    # Configuration & logging
+    "omegaconf>=2.3.0",
+    "wandb>=0.16.0",
+
+    # Attention & optimization
+    "xformers>=0.0.25",
+
+    # Tokenization
+    "sentencepiece>=0.2.0",
+    "tiktoken>=0.6.0",
+
+    # Numerical computing
+    "numpy>=1.26.0",
+    "scipy>=1.12.0",
+
+    # Evaluation
+    "rouge-score>=0.1.2",
+    "sacrebleu>=2.4.0",
+
+    # Utilities
+    "blobfile>=2.1.0",
+    "orjson>=3.9.0",
+    "msgspec>=0.18.0",
+    "pynvml>=11.5.0",
+
+    # Profiling (optional but useful)
+    "viztracer>=0.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+eval = [
+    "lm-eval>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.uv]
+# Use system torch if available (useful for HPC with pre-built CUDA wheels)
+# Override with: uv sync --no-build-isolation
+no-build-isolation-package = ["torch", "xformers"]
+
+[tool.uv.sources]
+# For HPC systems like Compute Canada, you may want to use pre-built wheels
+# Uncomment and modify as needed:
+# torch = { url = "https://download.pytorch.org/whl/cu121" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]  # Line too long - handled by formatter
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
