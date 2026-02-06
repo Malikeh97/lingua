@@ -39,7 +39,8 @@ setup_compute_canada() {
 
     # Load required modules
     log_info "Loading modules..."
-    module load python/3.11 cuda/12.2 cudnn/8.9
+    module load cuda/12.6
+    module load gcc arrow/19.0.1 python/3.11
 
     # Default env location on scratch
     if [[ -z "$VIRTUAL_ENV" ]]; then
@@ -59,6 +60,10 @@ setup_compute_canada() {
     # Activate environment
     source "$ENV_PATH/bin/activate"
 
+    # Force all uv pip installs to target the venv, overriding any
+    # project-level [tool.uv.pip] system=true that would write to /cvmfs
+    local UV_PYTHON="$ENV_PATH/bin/python"
+
     # Install with Compute Canada optimizations
     log_info "Installing dependencies..."
 
@@ -66,13 +71,13 @@ setup_compute_canada() {
     if [[ -f /cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Core/python/3.11.5/lib/python3.11/site-packages/torch/__init__.py ]]; then
         log_info "Using system PyTorch from Compute Canada modules"
         # Install everything except torch
-        uv pip install -e "$PROJECT_DIR" --no-deps
-        uv pip install -r <(grep -v "^torch" "$PROJECT_DIR/pyproject.toml" 2>/dev/null || echo "")
+        uv pip install --python "$UV_PYTHON" -e "$PROJECT_DIR" --no-deps
+        uv pip install --python "$UV_PYTHON" -r <(grep -v "^torch" "$PROJECT_DIR/pyproject.toml" 2>/dev/null || echo "")
     else
-        # Install with PyTorch index for CUDA 12.1
+        # Install with PyTorch index for CUDA 12.6
         log_info "Installing PyTorch from pip..."
-        uv pip install torch --index-url https://download.pytorch.org/whl/cu121
-        uv pip install -e "$PROJECT_DIR"
+        uv pip install --python "$UV_PYTHON" torch --index-url https://download.pytorch.org/whl/cu126
+        uv pip install --python "$UV_PYTHON" -e "$PROJECT_DIR"
     fi
 
     log_info "Installation complete!"
@@ -101,7 +106,7 @@ setup_local() {
 
         # Install PyTorch with CUDA support
         log_info "Installing PyTorch with CUDA support..."
-        uv pip install torch --index-url https://download.pytorch.org/whl/cu121
+        uv pip install torch --index-url https://download.pytorch.org/whl/cu126
     else
         log_warn "No NVIDIA GPU detected, installing CPU-only PyTorch"
         uv pip install torch --index-url https://download.pytorch.org/whl/cpu

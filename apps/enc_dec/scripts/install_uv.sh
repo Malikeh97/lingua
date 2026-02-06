@@ -26,7 +26,7 @@ uv venv .venv --python 3.11 2>/dev/null || uv venv .venv
 
 # Install with PyTorch CUDA support
 source .venv/bin/activate
-uv pip install torch --index-url https://download.pytorch.org/whl/cu121
+uv pip install torch --index-url https://download.pytorch.org/whl/cu126
 uv pip install -e .
 
 echo ""

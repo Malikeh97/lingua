@@ -285,6 +285,7 @@ def train(args: EncDecTrainArgs):
                     freeze_pretrained=args.model.pretrained_decoder.freeze_pretrained,
                     init_base_std=args.model.decoder.init_base_std,
                     seed=args.model.seed,
+                    init_mode=args.model.pretrained_decoder.init_mode,
                 )
         else:
             # Initialize on meta device for efficiency

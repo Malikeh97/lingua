@@ -1,5 +1,5 @@
-name: mvp_modernbert_pretrained_dec_300M
-dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_300M
+name: mvp_modernbert_pretrained_dec_frozen_300M
+dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_frozen_300M
 max_epochs: 5
 seed: 42
 grad_acc_steps: 2
@@ -37,10 +37,11 @@ model:
     unfreeze_top_layers: 0  # Set to N to unfreeze top N layers (e.g., 2-4)
 
   # Pretrained decoder from HuggingFace
-  # Cross-attention layers will be randomly initialized since they don't exist in the HF model
+  # Cross-attention layers initialized based on init_mode since they don't exist in the HF model
   pretrained_decoder:
     model_name: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
-    freeze_pretrained: false  # All weights trainable
+    freeze_pretrained: true  # Freeze self-attention and FFN weights (cross-attention always trainable)
+    init_mode: none  # Cross-attention init: none (random), copy, zero, normal
 
   # Encoder args (not used when encoder_type=pretrained)
   encoder:
@@ -89,7 +90,7 @@ checkpoint:
   eval:
     every: 500
     keep: 2
-  path: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_300M/checkpoints
+  path: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_frozen_300M/checkpoints
   init_ckpt_path: null
   consolidate: true
 profiling:

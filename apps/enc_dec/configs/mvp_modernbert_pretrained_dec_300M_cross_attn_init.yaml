@@ -1,13 +1,13 @@
-name: mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_4layers
-dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_4layers
-max_epochs: 2
+name: mvp_modernbert_pretrained_dec_300M_cross_attn_init
+dump_dir: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_300M_cross_attn_init
+max_epochs: 5
 seed: 42
 grad_acc_steps: 2
 gc_collect_freq: 100
 optim:
-  lr: 1e-4
-  weight_decay: 0.01
-  warmup: 200
+  lr: 2e-4
+  weight_decay: 0.1
+  warmup: 500
   lr_min_ratio: 0.01
   clip: 1.0
 distributed:
@@ -33,11 +33,20 @@ model:
     encoder_dim: 768
     pooling: none
     use_flash_attention: true
-    freeze_encoder: true  # Set to false to train full encoder
-    unfreeze_top_layers: 4  # Set to N to unfreeze top N layers (e.g., 2-4)
+    freeze_encoder: true
+    unfreeze_top_layers: 0
 
-  # Decoder trained from scratch (no pretrained_decoder section)
-  # Cross-attention layers will be randomly initialized
+  # Pretrained decoder from HuggingFace
+  # Cross-attention layers initialized from self-attention weights
+  pretrained_decoder:
+    model_name: Malikeh1375/nemotron_fineinstructions_1T_judged_exp_chat_300M
+    freeze_pretrained: false
+    # Cross-attention initialization mode:
+    #   - none: Random initialization (original behavior)
+    #   - copy: Copy Q, K, V, O projections and layernorm from self-attention (recommended)
+    #   - zero: Copy Q, K, V, layernorm; zero-initialize O projection
+    #   - normal: Copy Q, K, V, layernorm; kaiming_normal initialize O projection
+    init_mode: copy
 
   # Encoder args (not used when encoder_type=pretrained)
   encoder:
@@ -45,7 +54,7 @@ model:
     n_heads: 12
     n_kv_heads: 12
 
-  # Decoder architecture - trained from scratch
+  # Decoder architecture must match the pretrained model
   decoder:
     n_layers: 32
     n_heads: 15
@@ -71,23 +80,22 @@ data:
   add_eos: true
   num_workers: 4
   prefetch_factor: 2
-  val_split_ratio: 0.1  # Hold out 10% of training data for validation
+  val_split_ratio: 0.1
   encoder_tokenizer_name: answerdotai/ModernBERT-base
   tokenizer:
     name: tiktoken
     path: /home/ehghaghi/projects/aip-craffel/ehghaghi/lingua/tokenizers/llama3_tiktoken_bpe_tokenizer/original/tokenizer.model
 eval:
-  every: 100  # Evaluate every 100 optimizer steps
-  max_steps: null  # Use full validation set
+  every: 100
+  max_steps: null
 checkpoint:
   dump:
     every: 500
-    keep: 1
+    keep: 2
   eval:
     every: 500
     keep: 2
-  path: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_scratch_dec_300M_frozen_Modern_BERT_4layers
-/checkpoints
+  path: /home/ehghaghi/scratch/ehghaghi/mvp_modernbert_pretrained_dec_300M_cross_attn_init/checkpoints
   init_ckpt_path: null
   consolidate: true
 profiling:

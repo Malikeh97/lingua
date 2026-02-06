@@ -96,11 +96,12 @@ class PretrainedDecoderArgs:
     """Arguments for pretrained decoder initialization from HuggingFace.
 
     Loads weights from a HuggingFace causal LM model (e.g., LLaMA-style).
-    Cross-attention layers are randomly initialized since they don't exist
-    in standard causal LM models.
+    Cross-attention layers are initialized based on init_mode from self-attention
+    weights since they don't exist in standard causal LM models.
     """
     model_name: str = ""  # HuggingFace model name/path (empty = no pretrained decoder)
     freeze_pretrained: bool = False  # Whether to freeze loaded weights (cross-attention always trainable)
+    init_mode: str = "none"  # Cross-attention init: "none" (random), "copy", "zero", "normal"
 
 
 @dataclass
@@ -923,17 +924,89 @@ class Decoder(nn.Module):
             layer.init_weights(self.init_base_std, factor)
 
 
+def initialize_cross_attention_weights(
+    decoder,
+    init_mode: str = "copy",
+) -> int:
+    """Initialize cross-attention weights from self-attention weights.
+
+    This function copies weights from self-attention layers to cross-attention
+    layers, providing a better initialization than random for cross-attention
+    in encoder-decoder models.
+
+    Args:
+        decoder: The Decoder, CopyDecoder, PointerDecoder, or SpanPointerDecoder module
+        init_mode: Initialization mode:
+            - "copy": Copy all projections (q, k, v, o) and layernorm
+            - "zero": Copy q, k, v, layernorm but zero-initialize o projection
+            - "normal": Copy q, k, v, layernorm but kaiming_normal initialize o projection
+
+    Returns:
+        Number of parameters initialized from self-attention
+
+    Note:
+        - Handles dimension mismatches by slicing (e.g., if cross-attn has fewer kv_heads)
+        - Works with both standard DecoderBlock and CopyDecoderBlock
+        - The layernorm is copied from ffn_norm (which maps to post_attention_layernorm
+          in HuggingFace models) to cross_attention_norm
+    """
+    if init_mode.lower() not in ["copy", "zero", "normal"]:
+        raise ValueError(f"Unknown init_mode: {init_mode}. Must be one of: copy, zero, normal")
+
+    initialized_params = 0
+    logger.info(f"Initializing cross-attention weights from self-attention (mode: {init_mode})")
+
+    for layer_idx, layer in enumerate(decoder.layers):
+        # Get self-attention and cross-attention modules
+        self_attn = layer.self_attention
+        cross_attn = layer.cross_attention
+
+        # Copy Q projection (full copy, same dimensions expected)
+        cross_attn.wq.weight.data = self_attn.wq.weight.data.clone()
+        initialized_params += cross_attn.wq.weight.numel()
+
+        # Copy K projection (handle dimension mismatch via slicing)
+        k_out_features = cross_attn.wk.out_features
+        k_in_features = cross_attn.wk.in_features
+        cross_attn.wk.weight.data = self_attn.wk.weight.data[:k_out_features, :k_in_features].clone()
+        initialized_params += cross_attn.wk.weight.numel()
+
+        # Copy V projection (handle dimension mismatch via slicing)
+        v_out_features = cross_attn.wv.out_features
+        v_in_features = cross_attn.wv.in_features
+        cross_attn.wv.weight.data = self_attn.wv.weight.data[:v_out_features, :v_in_features].clone()
+        initialized_params += cross_attn.wv.weight.numel()
+
+        # Initialize O projection based on mode
+        if init_mode.lower() == "copy":
+            cross_attn.wo.weight.data = self_attn.wo.weight.data.clone()
+        elif init_mode.lower() == "zero":
+            torch.nn.init.zeros_(cross_attn.wo.weight.data)
+        elif init_mode.lower() == "normal":
+            torch.nn.init.kaiming_normal_(cross_attn.wo.weight.data)
+        initialized_params += cross_attn.wo.weight.numel()
+
+        # Copy layernorm: ffn_norm -> cross_attention_norm
+        # (ffn_norm corresponds to HF's post_attention_layernorm)
+        layer.cross_attention_norm.weight.data = layer.ffn_norm.weight.data.clone()
+        initialized_params += layer.cross_attention_norm.weight.numel()
+
+    logger.info(f"Initialized {initialized_params:,} cross-attention parameters from self-attention")
+    return initialized_params
+
+
 def load_pretrained_decoder_weights(
     decoder: Decoder,
     model_name: str,
     freeze_pretrained: bool = False,
     init_base_std: Optional[float] = None,
     seed: int = 42,
+    init_mode: str = "none",
 ) -> Tuple[int, int]:
     """Load weights from a HuggingFace causal LM model into the decoder.
 
     Maps weights from LLaMA-style HF models to the enc_dec decoder.
-    Cross-attention layers are randomly initialized since they don't exist in HF models.
+    Cross-attention layers are initialized based on init_mode.
 
     Args:
         decoder: The Decoder module to load weights into
@@ -941,6 +1014,11 @@ def load_pretrained_decoder_weights(
         freeze_pretrained: Whether to freeze loaded weights (cross-attention always trainable)
         init_base_std: Base std for random initialization of cross-attention
         seed: Random seed for cross-attention initialization
+        init_mode: Cross-attention initialization mode:
+            - "none": Random initialization (original behavior)
+            - "copy": Copy all projections (q, k, v, o) and layernorm from self-attention
+            - "zero": Copy q, k, v, layernorm; zero-initialize o projection
+            - "normal": Copy q, k, v, layernorm; kaiming_normal initialize o projection
 
     Returns:
         Tuple of (loaded_params, initialized_params) counts
@@ -1018,22 +1096,25 @@ def load_pretrained_decoder_weights(
     # Load state dict with matched weights
     decoder.load_state_dict(decoder_state_dict, strict=False)
 
-    # Initialize cross-attention layers randomly
+    # Initialize cross-attention layers
     initialized_params = 0
     init_std = init_base_std or (decoder.dim ** (-0.5))
 
     with torch.random.fork_rng(devices=[torch.cuda.current_device()] if torch.cuda.is_available() else []):
         torch.manual_seed(seed)
-        for i, layer in enumerate(decoder.layers):
-            # Initialize cross-attention weights
-            layer.cross_attention.reset_parameters(init_std)
-            layer.cross_attention_norm.reset_parameters()
 
-            # Count cross-attention params
-            for param in layer.cross_attention.parameters():
-                initialized_params += param.numel()
-            for param in layer.cross_attention_norm.parameters():
-                initialized_params += param.numel()
+        if init_mode.lower() == "none":
+            # Random initialization (original behavior)
+            for layer in decoder.layers:
+                layer.cross_attention.reset_parameters(init_std)
+                layer.cross_attention_norm.reset_parameters()
+                for param in layer.cross_attention.parameters():
+                    initialized_params += param.numel()
+                for param in layer.cross_attention_norm.parameters():
+                    initialized_params += param.numel()
+        else:
+            # Initialize from self-attention weights
+            initialized_params = initialize_cross_attention_weights(decoder, init_mode)
 
     # Initialize rope embeddings (not in HF checkpoint)
     decoder.rope_embeddings.reset_parameters()
@@ -1047,7 +1128,10 @@ def load_pretrained_decoder_weights(
                 param.requires_grad = False
 
     logger.info(f"Loaded {loaded_params:,} parameters from pretrained model")
-    logger.info(f"Randomly initialized {initialized_params:,} parameters (cross-attention)")
+    if init_mode.lower() == "none":
+        logger.info(f"Randomly initialized {initialized_params:,} parameters (cross-attention)")
+    else:
+        logger.info(f"Initialized {initialized_params:,} cross-attention parameters from self-attention (mode: {init_mode})")
     if mismatched_params:
         logger.warning(f"Skipped {len(mismatched_params)} parameters due to shape mismatch")
 

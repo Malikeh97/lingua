@@ -23,7 +23,8 @@ echo ""
 
 # Load required modules
 echo "Loading modules..."
-module load python/3.11 cuda/12.2 cudnn/8.9 arrow/17
+module load cuda/12.6
+module load gcc arrow/19.0.1 python/3.11
 
 # Install uv if not available
 if ! command -v uv &> /dev/null; then
@@ -43,33 +44,37 @@ fi
 # Activate
 source "$ENV_PATH/bin/activate"
 
-# Install PyTorch with CUDA 12.1 support
+# Force all uv pip installs to target the venv, overriding any
+# project-level [tool.uv.pip] system=true that would write to /cvmfs
+UV_PYTHON="$ENV_PATH/bin/python"
+
+# Install PyTorch with CUDA 12.6 support
 echo "Installing PyTorch..."
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+uv pip install --python "$UV_PYTHON" torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 
 # Install xformers (CUDA-specific)
 echo "Installing xformers..."
-uv pip install xformers --index-url https://download.pytorch.org/whl/cu121 || \
-    uv pip install xformers
+uv pip install --python "$UV_PYTHON" xformers --index-url https://download.pytorch.org/whl/cu126 || \
+    uv pip install --python "$UV_PYTHON" xformers
 
 # Install flash-attn (requires CUDA)
 echo "Installing flash-attention..."
-uv pip install flash-attn --no-build-isolation || \
+uv pip install --python "$UV_PYTHON" flash-attn --no-build-isolation || \
     echo "Warning: flash-attn installation failed (may need to build from source)"
 
 # Install project in editable mode
 echo "Installing enc-dec project..."
 cd "$PROJECT_DIR"
-uv pip install -e .
+uv pip install --python "$UV_PYTHON" -e .
 
 # Install lingua package from parent
 echo "Installing lingua package..."
 cd "$LINGUA_DIR"
-uv pip install -e . 2>/dev/null || uv pip install -r requirements.txt
+uv pip install --python "$UV_PYTHON" -e . 2>/dev/null || uv pip install --python "$UV_PYTHON" -r requirements.txt
 
 # Additional useful packages for training
 echo "Installing additional packages..."
-uv pip install \
+uv pip install --python "$UV_PYTHON" \
     deepspeed \
     peft \
     trl \
@@ -94,7 +99,8 @@ echo ""
 echo "=== Setup Complete ==="
 echo ""
 echo "To activate this environment:"
-echo "  module load python/3.11 cuda/12.2 cudnn/8.9 arrow/17"
+echo "  module load cuda/12.6"
+echo "  module load gcc arrow/19.0.1 python/3.11"
 echo "  source $ENV_PATH/bin/activate"
 echo ""
 echo "Add to your SLURM scripts:"

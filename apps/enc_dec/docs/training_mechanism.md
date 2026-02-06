@@ -185,12 +185,30 @@ model:
   pretrained_decoder:
     model_name: meta-llama/Llama-3-8B
     freeze_pretrained: false  # Cross-attention always trainable
+    init_mode: copy           # Cross-attention initialization mode
 ```
 
-Weight mapping (`enc_dec.py:926`):
+Weight mapping (`enc_dec.py:998`):
 - Self-attention: `q_proj`, `k_proj`, `v_proj`, `o_proj` -> `wq`, `wk`, `wv`, `wo`
 - FFN: `gate_proj`, `up_proj`, `down_proj` -> `w1`, `w3`, `w2`
-- Cross-attention: randomly initialized (doesn't exist in causal LM)
+- Cross-attention: initialized based on `init_mode` (see below)
+
+### Cross-Attention Initialization Modes
+
+The `init_mode` parameter controls how cross-attention layers are initialized from self-attention weights (`enc_dec.py:927`):
+
+| Mode | Q, K, V | O Projection | LayerNorm | Description |
+|------|---------|--------------|-----------|-------------|
+| `none` | Random | Random | Random | Original behavior |
+| `copy` | Copy from self-attn | Copy from self-attn | Copy from ffn_norm | Recommended |
+| `zero` | Copy from self-attn | Zero-initialized | Copy from ffn_norm | Gradual integration |
+| `normal` | Copy from self-attn | Kaiming normal | Copy from ffn_norm | Alternative |
+
+**Rationale:**
+- Q projection operates on the same decoder hidden states as self-attention
+- K/V projections work on encoder outputs (different from self-attention), but copying provides reasonable initialization
+- LayerNorm is copied from `ffn_norm` (which comes from HF's `post_attention_layernorm`)
+- `init_mode: copy` is recommended for better training stability
 
 ## Configuration
 
