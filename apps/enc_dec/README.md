@@ -62,7 +62,7 @@ python -c "import transformers; print(f'Transformers {transformers.__version__}'
 | File | Description |
 |------|-------------|
 | `pyproject.toml` | Project dependencies and metadata |
-| `requirements-core.txt` | Direct dependencies (clean list) |
+| `requirements.txt` | Direct dependencies (clean list) |
 | `scripts/setup_cc.sh` | Compute Canada setup script |
 | `scripts/install_uv.sh` | Quick local install script |
 | `slurm/template_uv.slurm` | SLURM template using uv environment |
