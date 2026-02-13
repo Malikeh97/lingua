@@ -3,7 +3,7 @@ name = "lingua"
 version = "0.1.0"
 description = "Lingua - Language model training framework"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "numpy",
     "omegaconf",
@@ -20,27 +20,18 @@ dependencies = [
     "pynvml",
     "datatrove",
     "orjson",
-]
-
-[project.optional-dependencies]
-gpu = [
     "torch==2.7.0",
     "xformers",
-]
-enc-dec = [
     "datasets",
     "transformers",
-]
-dev = [
+    "huggingface_hub",
     "ninja",
+    "pip",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv]
-python-preference = "system"
-
-[tool.uv.pip]
-system = true
+[tool.uv.extra-build-dependencies]
+xformers = ["torch"]

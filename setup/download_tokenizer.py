@@ -6,6 +6,7 @@ from requests.exceptions import HTTPError
 TOKENIZER = {
     "llama2": ("meta-llama/Llama-2-7b", "tokenizer.model"),
     "llama3": ("meta-llama/Meta-Llama-3-8B", "original/tokenizer.model"),
+    "llama3.1": ("meta-llama/Llama-3.1-8B", "original/tokenizer.model"),
     "gemma": ("google/gemma-2-9b", "tokenizer.model"),
 }
 

@@ -8,9 +8,6 @@ echo "============================================"
 module load cuda/12.6
 module load gcc arrow/19.0.1 python/3.11
 
-# Set paths
-export SCRATCH="/home/ehghaghi/scratch/ehghaghi"
-
 mkdir -p logs
 
 # Install UV if not available
@@ -23,9 +20,9 @@ fi
 echo "UV version: $(uv --version)"
 
 
-# Install project with all optional dependencies using uv sync
+# Install project with dependencies using uv sync
 echo "Installing lingua with dependencies..."
-uv sync --extra gpu --extra enc-dec --extra dev
+uv sync
 
 source .venv/bin/activate
 
