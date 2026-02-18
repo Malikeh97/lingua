@@ -647,6 +647,29 @@ class DecoderLayer(nn.Module):
             return x, cross_attn_weights
         return x
 
+    def init_weights(self, init_std: float, factor: float):
+        """Lingua-style init: truncated normal, output projections scaled by factor."""
+        out_std = init_std / factor
+        ffn_out_std = (self.ffn[0].out_features ** -0.5) / factor
+
+        def tn(w, std):
+            nn.init.trunc_normal_(w, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+        # Attention Q/K/V and output projections
+        for attn in [self.self_attn, self.cross_attn]:
+            if attn.in_proj_weight is not None:
+                tn(attn.in_proj_weight, init_std)
+            tn(attn.out_proj.weight, out_std)
+
+        # FFN
+        tn(self.ffn[0].weight, init_std)
+        tn(self.ffn[3].weight, ffn_out_std)
+
+        # LayerNorms to ones
+        for norm in [self.self_attn_norm, self.cross_attn_norm, self.ffn_norm]:
+            nn.init.ones_(norm.weight)
+            nn.init.zeros_(norm.bias)
+
 
 class AttentionSpanHead(nn.Module):
     """Learns to extract span positions from cross-attention weights.
@@ -694,7 +717,9 @@ class AttentionSpanHead(nn.Module):
 
         # Apply learned weights and sum across layers/heads
         # Use raw weights (no softmax) to allow sharp distributions in output logits
-        start_weights = self.start_layer_weights.view(self.num_layers, self.num_heads, 1)
+        start_weights = self.start_layer_weights.view(
+            self.num_layers, self.num_heads, 1
+        )
         end_weights = self.end_layer_weights.view(self.num_layers, self.num_heads, 1)
 
         # Weighted sum: (batch, src_len)
@@ -769,7 +794,9 @@ class UnifiedModel(nn.Module):
         self.num_encoder_layers = config.num_hidden_layers
         self.enc_local_layers = int(enc_local_layer_ratio * self.num_encoder_layers)
         if self.enc_local_layers > 0 and model_type == "encdec":
-            print(f"Encoder local attention: bottom {self.enc_local_layers}/{self.num_encoder_layers} layers")
+            print(
+                f"Encoder local attention: bottom {self.enc_local_layers}/{self.num_encoder_layers} layers"
+            )
 
         # Custom decoder for enc-dec generation (not needed for bertlike-only)
         if model_type == "encdec" and span_expr != "bertlike":
@@ -835,6 +862,43 @@ class UnifiedModel(nn.Module):
 
         self.vocab_size = new_vocab_size
 
+    def init_weights(self):
+        """Lingua-style init: truncated normal ±3σ, output scaling by sqrt(3*n_layers)."""
+        if not hasattr(self, "decoder_layers"):
+            return
+
+        std = self.hidden_size ** -0.5
+        factor = (3 * len(self.decoder_layers)) ** 0.5
+
+        def tn(weight):
+            nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+        # Decoder layers
+        for layer in self.decoder_layers:
+            layer.init_weights(std, factor)
+
+        # Embeddings (skip if inherited from encoder)
+        for name in ["decoder_embed", "pos_embed"]:
+            if hasattr(self, name):
+                weight = getattr(self, name).weight
+                if not getattr(weight, "is_pretrained", False):
+                    tn(weight)
+
+        # LayerNorm
+        if hasattr(self, "output_norm"):
+            nn.init.ones_(self.output_norm.weight)
+            nn.init.zeros_(self.output_norm.bias)
+
+        # Span heads
+        if hasattr(self, "qa_outputs"):
+            tn(self.qa_outputs.weight)
+            if self.qa_outputs.bias is not None:
+                nn.init.zeros_(self.qa_outputs.bias)
+
+        if hasattr(self, "attn_span_head"):
+            nn.init.ones_(self.attn_span_head.start_layer_weights)
+            nn.init.ones_(self.attn_span_head.end_layer_weights)
+
     def _create_segment_mask(self, input_ids, attention_mask):
         """Create attention mask that blocks attention across SEP boundaries.
 
@@ -842,7 +906,7 @@ class UnifiedModel(nn.Module):
         Tokens can only attend within their segment (between SEP tokens).
         """
         # Find SEP positions: (batch, seq_len)
-        is_sep = (input_ids == self.sep_token_id)
+        is_sep = input_ids == self.sep_token_id
 
         # Create segment IDs by cumsum of SEP positions
         # Each segment gets a unique ID: tokens before first SEP = 0, between first and second = 1, etc.
@@ -863,19 +927,27 @@ class UnifiedModel(nn.Module):
     def _get_encoder_layers(self):
         """Get the list of encoder layers from the base model."""
         # ModernBERT / BERT-style models
-        if hasattr(self.base_model, "encoder") and hasattr(self.base_model.encoder, "layers"):
+        if hasattr(self.base_model, "encoder") and hasattr(
+            self.base_model.encoder, "layers"
+        ):
             return self.base_model.encoder.layers
         # Some models use 'layer' instead of 'layers'
-        if hasattr(self.base_model, "encoder") and hasattr(self.base_model.encoder, "layer"):
+        if hasattr(self.base_model, "encoder") and hasattr(
+            self.base_model.encoder, "layer"
+        ):
             return self.base_model.encoder.layer
         # Fallback for other architectures
-        raise ValueError(f"Cannot find encoder layers in model: {type(self.base_model)}")
+        raise ValueError(
+            f"Cannot find encoder layers in model: {type(self.base_model)}"
+        )
 
     def _get_encoder_embeddings_module(self):
         """Get the embeddings module from the base model."""
         if hasattr(self.base_model, "embeddings"):
             return self.base_model.embeddings
-        if hasattr(self.base_model, "model") and hasattr(self.base_model.model, "embeddings"):
+        if hasattr(self.base_model, "model") and hasattr(
+            self.base_model.model, "embeddings"
+        ):
             return self.base_model.model.embeddings
         raise ValueError(f"Cannot find embeddings in model: {type(self.base_model)}")
 
@@ -915,7 +987,9 @@ class UnifiedModel(nn.Module):
                 hidden_states = layer_output
 
         # Apply final layer norm if present
-        if hasattr(self.base_model, "encoder") and hasattr(self.base_model.encoder, "final_layer_norm"):
+        if hasattr(self.base_model, "encoder") and hasattr(
+            self.base_model.encoder, "final_layer_norm"
+        ):
             hidden_states = self.base_model.encoder.final_layer_norm(hidden_states)
 
         return hidden_states.float()
@@ -1813,6 +1887,9 @@ def main():
         enc_local_layer_ratio=args.enc_local_layer_ratio,
         sep_token_id=tokenizer.sep_token_id,
     )
+
+    # Initialize custom decoder weights with lingua-style initialization
+    model.init_weights()
 
     model = model.to(args.device)
 

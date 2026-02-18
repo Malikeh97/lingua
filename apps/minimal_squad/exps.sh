@@ -4,7 +4,7 @@ ibash
 
 
 # Q/C/A (decoder-only) -> val/exact_match 90
-export RUN_NAME="tinyllama_1b_decoder_standard"
+export RUN_NAME="tinyllama_1b_qca_decoder"
 export COMMAND="python -m apps.minimal_squad.main \
     --wandb_run_name $RUN_NAME \
     --data_format Q/C/A \
@@ -15,7 +15,7 @@ export COMMAND="python -m apps.minimal_squad.main \
 submit "$RUN_NAME" "$COMMAND"
 
 # C/Q/A (decoder-only) -> val/exact_match 90
-export RUN_NAME="tinyllama_1b_decoder_context_cache"
+export RUN_NAME="tinyllama_1b_cqa_decoder"
 export COMMAND="python -m apps.minimal_squad.main \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q/A \
@@ -26,7 +26,7 @@ export COMMAND="python -m apps.minimal_squad.main \
 submit "$RUN_NAME" "$COMMAND"
 
 # C//Q/A (encoder-decoder, context in encoder) ->  val/exact_match 21.6
-export RUN_NAME="modernbert_150m_c_qa_6layer_generation"
+export RUN_NAME="modernbert_150m_c_qa_6layer_scaledinit_rerun"
 export COMMAND="python -m apps.minimal_squad.main \
     --wandb_run_name $RUN_NAME \
     --data_format C//Q/A \
@@ -38,7 +38,7 @@ export COMMAND="python -m apps.minimal_squad.main \
 submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A (encoder-decoder, context+question in encoder, answer in decoder) ->  val/exact_match 64.4
-export RUN_NAME="modernbert_150m_cq_a_6layer_generation"
+export RUN_NAME="modernbert_150m_cq_a_6layer_scaledinit_rerun"
 export COMMAND="python -m apps.minimal_squad.main \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
@@ -49,20 +49,20 @@ export COMMAND="python -m apps.minimal_squad.main \
     --pretrained_weight_updating 0.333"
 submit "$RUN_NAME" "$COMMAND"
 
-# Q/C//A (encoder-decoder, question+context in encoder, answer in decoder) -> val/exact_match 62.8
-export RUN_NAME="modernbert_150m_qc_a_6layer_generation"
-export COMMAND="python -m apps.minimal_squad.main \
-    --wandb_run_name $RUN_NAME \
-    --data_format Q/C//A \
-    --model_type encdec \
-    --span_expr none \
-    --model_name modernbert_150m \
-    --epochs 10 \
-    --pretrained_weight_updating 0.333"
-submit "$RUN_NAME" "$COMMAND"
+# # Q/C//A (encoder-decoder, question+context in encoder, answer in decoder) -> val/exact_match 62.8
+# export RUN_NAME="modernbert_150m_qc_a_6layer_generation"
+# export COMMAND="python -m apps.minimal_squad.main \
+#     --wandb_run_name $RUN_NAME \
+#     --data_format Q/C//A \
+#     --model_type encdec \
+#     --span_expr none \
+#     --model_name modernbert_150m \
+#     --epochs 10 \
+#     --pretrained_weight_updating 0.333"
+# submit "$RUN_NAME" "$COMMAND"
 
 # C//Q/A (encoder-decoder, context in encoder) 400m -> val/exact_match 20.6
-export RUN_NAME="modernbert_400m_c_qa_6layer_generation"
+export RUN_NAME="modernbert_400m_c_qa_6layer_scaledinit_rerun"
 export COMMAND="python -m apps.minimal_squad.main \
     --wandb_run_name $RUN_NAME \
     --data_format C//Q/A \
@@ -74,7 +74,7 @@ export COMMAND="python -m apps.minimal_squad.main \
 submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A (encoder-decoder, context+question in encoder, answer in decoder) 400m -> val/exact_match 79.2
-export RUN_NAME="modernbert_400m_cq_a_6layer_generation"
+export RUN_NAME="modernbert_400m_cq_a_6layer_scaledinit_rerun"
 export COMMAND="python -m apps.minimal_squad.main \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
