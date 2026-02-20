@@ -40,6 +40,13 @@ The key innovation is a **format string grammar** that controls how Question (Q)
 - `modernbert_400m` (answerdotai/ModernBERT-large)
 - `deberta_v3_300m`, `deberta_v2_900m`, `deberta_v2_1.5b`
 
+**Encoder-Decoder with Pre-trained Decoder (CEPE-style):**
+- Encoder: any of the above encoder models
+- Decoder: `tinyllama_1b`, `llama3.2_1b`, `llama3.2_3b`, `llama3.1_8b` (via `--decoder_model_name`)
+- Cross-attention adapters are injected between self-attention and FFN of each frozen decoder layer
+- Only cross-attention adapters + encoder projection are trained; decoder self-attention/FFN are frozen
+- Uses dual tokenizers (encoder tokenizer for Q/C, decoder tokenizer for A)
+
 **Decoder-Only (fine-tuned):**
 - `tinyllama_1b`, `llama3.2_1b`, `llama3.2_3b`, `llama3.1_8b`
 
@@ -135,10 +142,58 @@ Each experiment is submitted as a separate SLURM job to L40S GPUs. The `submit` 
 | `--batch_size` | `8` | Batch size |
 | `--lr` | `1e-4` | Learning rate |
 | `--pretrained_weight_updating` | `None` | If set (e.g. 0.333), scales pretrained LR; if None/0, freezes pretrained weights |
+| `--encoder_weight_updating` | `None` | Override `pretrained_weight_updating` for encoder only (CEPE-style freeze) |
 | `--num_decoder_layers` | `6` | Number of decoder layers (enc-dec only) |
 | `--max_length` | `8192` | Max encoder sequence length |
 | `--dec_max_length` | `8192` | Max decoder sequence length |
 | `--enc_local_layer_ratio` | `0.0` | Fraction of encoder layers using local attention |
+| `--decoder_model_name` | `None` | Pre-trained decoder model (e.g., `tinyllama_1b`). Enables CEPE-style cross-attention adapters |
+| `--cross_attn_num_heads` | `16` | Number of attention heads for cross-attention adapters |
+
+### Pre-trained Decoder (CEPE-style)
+
+Instead of training a decoder from scratch, you can use a pre-trained causal LM (e.g., TinyLlama) as the decoder. Cross-attention adapters are injected between each layer's self-attention and FFN, following the [CEPE](https://github.com/princeton-nlp/CEPE) approach:
+
+```
+Encoder (ModernBERT): input -> encoder_hidden [B, enc_len, 1024]
+Projection:           Linear(1024, 2048) -> projected [B, enc_len, 2048]
+Decoder (TinyLlama + cross-attn adapters):
+  For each of 22 layers:
+    1. Self-Attention (frozen, RoPE, GQA)
+    2. CrossAttentionAdapter(x, projected_encoder)  [trained]
+    3. FFN (frozen, SwiGLU)
+  Final: RMSNorm -> lm_head -> logits
+```
+
+Key design choices:
+- Output projection of cross-attention adapters is **zero-initialized**, so the model starts as the original TinyLlama and gradually learns to use encoder information
+- Dual tokenizers: encoder side uses ModernBERT tokenizer, decoder side uses TinyLlama tokenizer
+- `--pretrained_weight_updating 0.0` freezes both encoder and decoder (only adapters + projection trained, ~370M params)
+- `--pretrained_weight_updating 0.333` additionally fine-tunes encoder + decoder at 0.333x learning rate
+- `--encoder_weight_updating 0.333` with `--pretrained_weight_updating 0.0` gives CEPE-style training: decoder frozen, encoder fine-tuned at 0.333x LR
+
+**Cross-attention adapter initialization:**
+
+| Component | Init Strategy | Why |
+|-----------|--------------|-----|
+| Q/K/V projections (`in_proj_weight`) | Truncated normal, `std = hidden_size^{-0.5}` (±3σ bounds) | Standard scaled init for attention projections |
+| Output projection (`out_proj`) | **Zero-initialized** (weight and bias) | Adapter starts as no-op; model begins as vanilla TinyLlama |
+| LayerNorm (`cross_attn_norm`) | weight=1, bias=0 | Standard LayerNorm default |
+| Encoder projection (`Linear(1024, 2048)`) | Truncated normal, same std as decoder | Bridges encoder→decoder hidden size |
+
+The zero-initialized output projection is the key design choice (from CEPE): since each adapter uses a residual connection (`output = residual + cross_attn(x)`), zeroing `out_proj` means the cross-attention contributes nothing at initialization. The model starts as the original TinyLlama and gradually learns to use encoder information during training.
+
+```bash
+# Example: ModernBERT 400M encoder + TinyLlama decoder (frozen)
+python -m apps.minimal_squad.main \
+    --data_format "C/Q//A" \
+    --model_type encdec \
+    --model_name modernbert_400m \
+    --decoder_model_name tinyllama_1b \
+    --pretrained_weight_updating 0.0 \
+    --epochs 5 \
+    --batch_size 8
+```
 
 ### Monitoring
 
