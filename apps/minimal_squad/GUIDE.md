@@ -14,7 +14,7 @@ The `minimal_squad` app is a research framework for experimenting with **SQuAD q
 |------|---------|
 | `main.py` (~2000 lines) | Unified training script supporting multiple architectures, data formats, and span modes |
 | `bert_qa_baseline.py` (~450 lines) | Standard BERT-style extractive QA baseline for comparison |
-| `exps.sh` (~220 lines) | Batch experiment submission script with 17 configured experiments |
+| `exps.sh` (~220 lines) | Batch experiment submission script with 17 configured experiments (`cepe_exps.sh` for cepe replications) |
 
 ### Core Idea: A Format Grammar for QA
 
@@ -101,7 +101,7 @@ salloc --gres=gpu:l40s:1 --cpus-per-task=8 --mem=64000M \
 cd /home/ehghaghi/projects/aip-craffel/ehghaghi/lingua
 source setup/start_env.sh
 
-# 3. Copy a python command from exps.sh and run it directly, e.g.:
+# 3. Copy a python command from exps.sh or cepe_exps.sh and run it directly, e.g.:
 python -m apps.minimal_squad.main \
     --data_format "C/Q//S" \
     --span_expr bertlike \
@@ -122,7 +122,7 @@ cd /home/ehghaghi/projects/aip-craffel/ehghaghi/lingua
 source setup/start_env.sh
 
 # 2. Submit all experiments as SLURM jobs
-bash apps/minimal_squad/exps.sh
+bash apps/minimal_squad/exps.sh or bash apps/minimal_squad/cepe_exps.sh
 ```
 
 Each experiment is submitted as a separate SLURM job to L40S GPUs. The `submit` function handles:

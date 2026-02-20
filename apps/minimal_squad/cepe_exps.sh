@@ -10,7 +10,7 @@ ibash
 
 # C/Q//A with pretrained TinyLlama decoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert400m_tinyllama1b_cq_a_frozen"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -23,7 +23,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A with pretrained TinyLlama decoder (fine-tuned at 0.333x LR) -> val/exact_match ?
 export RUN_NAME="modernbert400m_tinyllama1b_cq_a_finetune"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -36,7 +36,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A with pretrained TinyLlama decoder + ModernBERT 150M encoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert150m_tinyllama1b_cq_a_frozen"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -54,7 +54,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A CEPE-style: ModernBERT 400M encoder (trained) + TinyLlama decoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert400m_tinyllama1b_cq_a_cepe"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -68,7 +68,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A CEPE-style: ModernBERT 150M encoder (trained) + TinyLlama decoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert150m_tinyllama1b_cq_a_cepe"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -82,7 +82,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C//Q/A with pretrained TinyLlama decoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert400m_tinyllama1b_c_qa_frozen"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C//Q/A \
     --model_type encdec \
@@ -95,7 +95,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C//Q/A with pretrained TinyLlama decoder (fine-tuned at 0.333x LR) -> val/exact_match ?
 export RUN_NAME="modernbert400m_tinyllama1b_c_qa_finetune"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C//Q/A \
     --model_type encdec \
@@ -108,7 +108,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C//Q/A with pretrained TinyLlama decoder + ModernBERT 150M encoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert150m_tinyllama1b_c_qa_frozen"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C//Q/A \
     --model_type encdec \
@@ -126,7 +126,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C//Q/A CEPE-style: ModernBERT 400M encoder (trained) + TinyLlama decoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert400m_tinyllama1b_c_qa_cepe"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C//Q/A \
     --model_type encdec \
@@ -140,7 +140,7 @@ submit "$RUN_NAME" "$COMMAND"
 
 # C//Q/A CEPE-style: ModernBERT 150M encoder (trained) + TinyLlama decoder (frozen) -> val/exact_match ?
 export RUN_NAME="modernbert150m_tinyllama1b_c_qa_cepe"
-export COMMAND="python -m apps.minimal_squad.main \
+export COMMAND="python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C//Q/A \
     --model_type encdec \
