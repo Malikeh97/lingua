@@ -59,7 +59,7 @@ if [[ $(hostname) == klogin* ]]; then
         local job_name="$1"
         local command="$2"
         should_skip_job "$job_name" && return 0
-        sbatch --job-name="$job_name" --output="logs/$job_name.out" --error="logs/$job_name.out" setup/submit_h100_killarney.sbatch "$command"
+        sbatch --job-name="$job_name" --output="logs/$job_name.out" --error="logs/$job_name.out" setup/submit_killarney_h100.sbatch "$command"
     }
 elif [[ $(hostname) == vulcan* ]]; then
     # define job submission function (vulcan)
