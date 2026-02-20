@@ -10,9 +10,9 @@ All experiments use `C/Q//A` format (context+question in encoder, answer generat
 |---|---|---|---|---|---|---|---|
 | `400m_frozen` | 400M | Adapters only | 371M (20%) | 43.4 (ep4) | 56.1 (ep4) | 41.6 | 53.9 |
 | `150m_frozen` | 150M | Adapters only | 371M (23%) | 22.4 (ep5) | 31.9 (ep5) | 22.4 | 31.9 |
-| `400m_cepe` | 400M | Adapters + Encoder | 766M (41%) | **77.6 (ep3)** | **85.4 (ep3)** | 76.4 | 85.0 |
+| `400m_cepe` | 400M | Adapters + Encoder | 766M (41%) | 77.6 (ep3) | 85.4 (ep3) | 76.4 | 85.0 |
 | `150m_cepe` | 150M | Adapters + Encoder | 520M (32%) | 55.6 (ep5) | 70.1 (ep3) | 55.6 | 69.4 |
-| `400m_finetune` | 400M | Everything | 1,866M (100%) | 78.4 (ep3) | 86.6 (ep3) | 76.6 | 85.2 |
+| `400m_finetune` | 400M | Everything | 1,866M (100%) | **78.4 (ep3)** | **86.6 (ep3)** | 76.6 | 85.2 |
 
 ## Epoch-by-Epoch EM%
 
