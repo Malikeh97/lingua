@@ -69,7 +69,7 @@ The key innovation is a **format string grammar** that controls how Question (Q)
 | ModernBERT 400M | C/Q//A (12L dec) | none (gen) | 82.2 |
 | ModernBERT 400M | C/Q//S | bertlike | **93.8** |
 
-**Takeaway:** Bert-like span extraction with ModernBERT 400M achieves the best results. Putting both C and Q in the encoder (`C/Q//`) consistently beats context-only (`C//Q`).
+**Takeaway:** Bert-like span extraction with ModernBERT 400M achieves the best results. Putting both C and Q in the encoder (`C/Q//`) consistently beats context-only (`C//Q`). See `reports/Feb20th_REPORT.md` for detailed CEPE pretrained-decoder results.
 
 ---
 
