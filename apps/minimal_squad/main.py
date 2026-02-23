@@ -54,6 +54,9 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
+from apps.minimal_squad.perlayer_attn import wrap_model_for_perlayer_attn
+
+
 # ============== Data Preparation ==============
 
 
@@ -167,6 +170,7 @@ class DataPreparer:
         # Cache special token IDs
         self.bos_id = tokenizer.bos_token_id or tokenizer.cls_token_id
         self.eos_id = tokenizer.eos_token_id or tokenizer.sep_token_id
+        self.sep_id = tokenizer.sep_token_id  # For segment separation
 
         # Part prefixes (boilerplate) - these never have loss
         # Note: Q/C/A are just format notation, prefixes are human-readable
@@ -261,7 +265,7 @@ class DataPreparer:
         labels = [-100]
         context_offset = None  # Track where C starts in assembled sequence
 
-        for part in parts:
+        for i, part in enumerate(parts):
             if part == "S":
                 # Special [SPAN] token for span extraction output
                 span_id = self.tokenizer.convert_tokens_to_ids("[SPAN]")
@@ -309,6 +313,11 @@ class DataPreparer:
                     labels.extend(part_ids)
                 else:
                     labels.extend([-100] * len(part_ids))
+
+            # Add SEP between segments (not after the last one)
+            if i < len(parts) - 1 and self.sep_id is not None:
+                input_ids.append(self.sep_id)
+                labels.append(-100)  # SEP tokens don't have loss
 
         # Add EOS
         input_ids.append(self.eos_id)
@@ -684,8 +693,14 @@ class AttentionSpanHead(nn.Module):
         self.num_heads = num_heads
         # Learned weights to combine attention from different layers/heads
         # Shape: (num_layers, num_heads) for start and end separately
-        self.start_layer_weights = nn.Parameter(torch.ones(num_layers, num_heads))
-        self.end_layer_weights = nn.Parameter(torch.ones(num_layers, num_heads))
+        # Initialize to 1/(num_layers*num_heads) so output scale is independent of layer/head count
+        init_val = 1.0 / (num_layers * num_heads)
+        self.start_layer_weights = nn.Parameter(
+            torch.full((num_layers, num_heads), init_val)
+        )
+        self.end_layer_weights = nn.Parameter(
+            torch.full((num_layers, num_heads), init_val)
+        )
 
     def forward(
         self,
@@ -717,10 +732,11 @@ class AttentionSpanHead(nn.Module):
 
         # Apply learned weights and sum across layers/heads
         # Use raw weights (no softmax) to allow sharp distributions in output logits
+        # Shape: (num_layers, 1, num_heads, 1) to broadcast with (num_layers, batch, num_heads, src_len)
         start_weights = self.start_layer_weights.view(
-            self.num_layers, self.num_heads, 1
+            self.num_layers, 1, self.num_heads, 1
         )
-        end_weights = self.end_layer_weights.view(self.num_layers, self.num_heads, 1)
+        end_weights = self.end_layer_weights.view(self.num_layers, 1, self.num_heads, 1)
 
         # Weighted sum: (batch, src_len)
         start_logits = (first_attn * start_weights).sum(dim=(0, 2))
@@ -750,16 +766,19 @@ class UnifiedModel(nn.Module):
         dropout: float = 0.1,
         max_seq_len: int = 8192,
         span_loss_weight: float = 1.0,
-        vocab_size: int = None,
         enc_local_layer_ratio: float = 0.0,
-        sep_token_id: int = None,
+        enc_local_mask_type: str = "segment",
+        add_span_token: bool = False,
     ):
         """
         Args:
             enc_local_layer_ratio: Fraction of bottom encoder layers that use local attention
                 (no attending across SEP boundaries). 0.0 = all global (default), 1.0 = all local.
                 E.g., 0.5 with 22 layers means bottom 11 layers are local.
-            sep_token_id: Token ID for [SEP]. Required if enc_local_layer_ratio > 0.
+            enc_local_mask_type: Type of local attention mask:
+                - "segment": bidirectional within each segment, no cross-SEP attention
+                - "block_causal": seg1 bidirectional (blocked from SEP+seg2), seg2 causal (sees all)
+            add_span_token: Whether to add [SPAN] special token for span extraction.
         """
         super().__init__()
         model_name = resolve_model_name(model_name)
@@ -768,7 +787,12 @@ class UnifiedModel(nn.Module):
         self.span_expr = span_expr
         self.span_loss_weight = span_loss_weight
         self.enc_local_layer_ratio = enc_local_layer_ratio
-        self.sep_token_id = sep_token_id
+        self.enc_local_mask_type = enc_local_mask_type
+
+        # Load tokenizer and setup special tokens
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        infer_special_tokens(self.tokenizer)
+        new_token_ids = self._setup_special_tokens(add_span_token)
 
         config = AutoConfig.from_pretrained(model_name)
         if hasattr(config, "attn_implementation"):
@@ -790,10 +814,19 @@ class UnifiedModel(nn.Module):
                 model_name, config=config, torch_dtype=torch.bfloat16
             )
 
+        # Resize embeddings if new tokens were added, init from newline
+        if new_token_ids:
+            self.resize_embeddings(len(self.tokenizer))
+            self._init_new_token_embeddings(new_token_ids)
+
+        self.sep_token_id = self.tokenizer.sep_token_id
+
         # Calculate local attention layer threshold for encoder
         self.num_encoder_layers = config.num_hidden_layers
         self.enc_local_layers = int(enc_local_layer_ratio * self.num_encoder_layers)
         if self.enc_local_layers > 0 and model_type == "encdec":
+            # Wrap base model for per-layer attention support
+            self.base_model = wrap_model_for_perlayer_attn(self.base_model)
             print(
                 f"Encoder local attention: bottom {self.enc_local_layers}/{self.num_encoder_layers} layers"
             )
@@ -801,10 +834,6 @@ class UnifiedModel(nn.Module):
         # Custom decoder for enc-dec generation (not needed for bertlike-only)
         if model_type == "encdec" and span_expr != "bertlike":
             self._init_decoder(num_decoder_layers, num_heads, dropout, max_seq_len)
-
-        # Resize embeddings if vocab_size differs (e.g., [SPAN] token added)
-        if vocab_size is not None and vocab_size != self.vocab_size:
-            self.resize_embeddings(vocab_size)
 
         # Span head based on span_expr mode
         if span_expr in ("bertlike", "first_last_hidden"):
@@ -817,6 +846,65 @@ class UnifiedModel(nn.Module):
         # Mark pretrained params
         for p in self.base_model.parameters():
             p.is_pretrained = True
+
+    def _setup_special_tokens(self, add_span_token: bool) -> List[int]:
+        """Setup special tokens (SEP, SPAN) and return IDs of newly added tokens."""
+        new_token_ids = []
+
+        # Ensure SEP token exists
+        if self.tokenizer.sep_token is None:
+            # Check for <|eom_id|> (Llama-style end-of-message)
+            eom_token = "<|eom_id|>"
+            eom_id = self.tokenizer.convert_tokens_to_ids(eom_token)
+            if eom_id != self.tokenizer.unk_token_id:
+                self.tokenizer.sep_token = eom_token
+                print(f"Using {eom_token} as SEP token (id: {eom_id})")
+            else:
+                # Add new [SEP] token
+                self.tokenizer.add_special_tokens({"sep_token": "[SEP]"})
+                new_token_ids.append(self.tokenizer.sep_token_id)
+                print(f"Added new [SEP] token (id: {self.tokenizer.sep_token_id})")
+        else:
+            print(
+                f"Using existing SEP token: {self.tokenizer.sep_token} (id: {self.tokenizer.sep_token_id})"
+            )
+
+        # Add [SPAN] token if needed
+        if add_span_token:
+            special_tokens = (
+                getattr(self.tokenizer, "additional_special_tokens", None) or []
+            )
+            if "[SPAN]" not in special_tokens:
+                self.tokenizer.add_special_tokens(
+                    {"additional_special_tokens": special_tokens + ["[SPAN]"]}
+                )
+                span_id = self.tokenizer.convert_tokens_to_ids("[SPAN]")
+                new_token_ids.append(span_id)
+                print(f"Added [SPAN] special token (id: {span_id})")
+
+        return new_token_ids
+
+    def _init_new_token_embeddings(self, token_ids: List[int]):
+        """Initialize embeddings for newly added tokens from newline token."""
+        newline_ids = self.tokenizer.encode("\n", add_special_tokens=False)
+        if not newline_ids:
+            print("Warning: Could not find newline token for embedding initialization")
+            return
+
+        newline_id = newline_ids[0]
+        embeddings = get_encoder_embeddings(self.base_model, self.model_name)
+        if embeddings is None:
+            print("Warning: Could not get embeddings for initialization")
+            return
+
+        with torch.no_grad():
+            for token_id in token_ids:
+                # embeddings is already the weight tensor (from get_encoder_embeddings)
+                embeddings[token_id] = embeddings[newline_id].clone()
+                token_str = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+                print(
+                    f"Initialized {token_str} embedding from newline token (id: {newline_id})"
+                )
 
     def _init_decoder(self, num_decoder_layers, num_heads, dropout, max_seq_len):
         """Initialize decoder components for enc-dec generation."""
@@ -867,7 +955,7 @@ class UnifiedModel(nn.Module):
         if not hasattr(self, "decoder_layers"):
             return
 
-        std = self.hidden_size ** -0.5
+        std = self.hidden_size**-0.5
         factor = (3 * len(self.decoder_layers)) ** 0.5
 
         def tn(weight):
@@ -899,34 +987,42 @@ class UnifiedModel(nn.Module):
             nn.init.ones_(self.attn_span_head.start_layer_weights)
             nn.init.ones_(self.attn_span_head.end_layer_weights)
 
-    def _create_segment_mask(self, input_ids, attention_mask):
-        """Create attention mask that blocks attention across SEP boundaries.
+    def _create_segment_mask(self, input_ids, attention_mask, causal=False):
+        """Create attention mask based on SEP-delimited segments.
+
+        Args:
+            causal: If False, bidirectional within segment (seg[i] == seg[j]).
+                    If True, block-causal (seg[j] <= seg[i] AND j <= i within same segment).
 
         Returns a 4D mask of shape (batch, 1, seq_len, seq_len) where True = blocked.
-        Tokens can only attend within their segment (between SEP tokens).
         """
-        # Find SEP positions: (batch, seq_len)
-        is_sep = input_ids == self.sep_token_id
+        # Segment IDs via cumsum: tokens before first SEP = 0, after = 1, etc.
+        segment_ids = (input_ids == self.sep_token_id).cumsum(dim=1)
+        seg_i = segment_ids.unsqueeze(2)  # (batch, seq_len, 1)
+        seg_j = segment_ids.unsqueeze(1)  # (batch, 1, seq_len)
 
-        # Create segment IDs by cumsum of SEP positions
-        # Each segment gets a unique ID: tokens before first SEP = 0, between first and second = 1, etc.
-        segment_ids = is_sep.cumsum(dim=1)  # (batch, seq_len)
+        if causal:
+            # Block if attending to future segment (bidirectional within each segment)
+            mask = seg_j > seg_i
+        else:
+            # Block if different segment (bidirectional within segment only)
+            mask = seg_i != seg_j
 
-        # Create mask: can only attend if in same segment
-        # (batch, seq_len, 1) != (batch, 1, seq_len) -> (batch, seq_len, seq_len)
-        segment_mask = segment_ids.unsqueeze(2) != segment_ids.unsqueeze(1)
-
-        # Combine with padding mask: also block attention to padding
-        # attention_mask is (batch, seq_len), 1 = attend, 0 = block
-        padding_mask = (attention_mask == 0).unsqueeze(1)  # (batch, 1, seq_len)
-        combined_mask = segment_mask | padding_mask  # (batch, seq_len, seq_len)
-
-        # Add head dimension: (batch, 1, seq_len, seq_len)
-        return combined_mask.unsqueeze(1)
+        # Combine with padding mask (block both rows and columns for padding)
+        is_pad = attention_mask == 0  # (batch, seq_len)
+        pad_rows = is_pad.unsqueeze(
+            2
+        )  # (batch, seq_len, 1) - padding can't see anything
+        pad_cols = is_pad.unsqueeze(1)  # (batch, 1, seq_len) - nothing can see padding
+        mask = mask | pad_rows | pad_cols
+        return mask.unsqueeze(1)
 
     def _get_encoder_layers(self):
         """Get the list of encoder layers from the base model."""
-        # ModernBERT / BERT-style models
+        # ModernBERT: layers directly on model
+        if hasattr(self.base_model, "layers"):
+            return self.base_model.layers
+        # BERT-style: encoder.layers
         if hasattr(self.base_model, "encoder") and hasattr(
             self.base_model.encoder, "layers"
         ):
@@ -954,45 +1050,32 @@ class UnifiedModel(nn.Module):
     def _run_encoder(self, input_ids, attention_mask):
         """Run encoder and return hidden states.
 
-        If enc_local_layers > 0, applies segment-local attention to bottom layers.
+        If enc_local_layer_ratio > 0, uses wrapped model with per-layer attention masks.
         """
-        # Fast path: no local attention restriction
-        if self.enc_local_layers == 0:
+        if self.enc_local_layer_ratio == 0:
             return self.base_model(
                 input_ids=input_ids, attention_mask=attention_mask
             ).last_hidden_state.float()
 
-        # Slow path: per-layer attention control
-        # Create masks
-        # Global mask: standard padding mask, shape (batch, 1, 1, seq_len) for broadcasting
-        global_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2).float()) * -1e9
+        # Create per-layer masks: local for bottom layers, global for top
+        causal = self.enc_local_mask_type == "block_causal"
+        local_blocked = self._create_segment_mask(input_ids, attention_mask, causal=causal)
+        local_mask = local_blocked.to(dtype=torch.bfloat16) * torch.finfo(torch.bfloat16).min
+        global_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2).to(torch.bfloat16)) * torch.finfo(torch.bfloat16).min
 
-        # Local mask: segment-isolated + padding, shape (batch, 1, seq_len, seq_len)
-        segment_blocked = self._create_segment_mask(input_ids, attention_mask)
-        local_mask = segment_blocked.float() * -1e9
+        # Build list of masks, one per layer
+        num_layers = self.num_encoder_layers
+        layer_masks = [
+            local_mask if i < self.enc_local_layers else global_mask
+            for i in range(num_layers)
+        ]
 
-        # Get embeddings
-        embeddings_module = self._get_encoder_embeddings_module()
-        hidden_states = embeddings_module(input_ids)
-
-        # Run through layers with appropriate masks
-        layers = self._get_encoder_layers()
-        for i, layer in enumerate(layers):
-            mask = local_mask if i < self.enc_local_layers else global_mask
-            # Most HF layers return tuple (hidden_states, ...) or object with last_hidden_state
-            layer_output = layer(hidden_states, attention_mask=mask)
-            if isinstance(layer_output, tuple):
-                hidden_states = layer_output[0]
-            else:
-                hidden_states = layer_output
-
-        # Apply final layer norm if present
-        if hasattr(self.base_model, "encoder") and hasattr(
-            self.base_model.encoder, "final_layer_norm"
-        ):
-            hidden_states = self.base_model.encoder.final_layer_norm(hidden_states)
-
-        return hidden_states.float()
+        # Use wrapped model with per-layer masks
+        return self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            layer_attention_masks=layer_masks,
+        ).last_hidden_state.float()
 
     def _run_custom_decoder(
         self,
@@ -1170,62 +1253,207 @@ class UnifiedModel(nn.Module):
         tokenizer=None,
         max_new_tokens=64,
         decoder_prefix_ids=None,
+        debug: bool = False,
         **kwargs,
     ):
-        """Generate answer: first generate tokens, then optionally resolve span.
+        """Generate answer and optionally resolve span extraction.
 
-        Structure:
-        1. Generate phase: produce decoder tokens (skip for bertlike)
-        2. Resolve phase: if span extraction, locate span in encoder using anchors + logits
+        Step 1: Generate tokens + capture signals (attention/hidden as needed)
+        Step 2: Parse anchors, aggregate scores, find matching positions
 
         Returns:
-            For span_expr != "none": extracted span token IDs from encoder
-            For span_expr == "none": generated decoder token IDs
+            span_expr == "none": generated token IDs (batch, seq_len)
+            otherwise: tuple (start_indices, end_indices) each shape (batch,)
         """
-        # Step 1: Generate decoder tokens
+        # Determine context input based on model type
+        if self.model_type == "dec":
+            context_ids = input_ids
+            context_mask = attention_mask
+        else:
+            context_ids = encoder_input_ids
+            context_mask = encoder_attention_mask
+
+        # === Step 1: Generate + capture signals ===
         if self.span_expr == "bertlike":
-            # No generation needed, skip to span resolution
+            # No generation, just get hidden states for span prediction
             generated_ids = None
-            encoder_output = None
-            cross_attn_weights = None
+            hidden_states, attentions = self._get_context_signals(
+                context_ids, context_mask, need_attn=False
+            )
         elif self.model_type == "dec":
-            # Decoder-only generation
+            # Decoder-only: generate then get signals from full sequence
             generated_ids = self.base_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 **kwargs,
             )
-            encoder_output = None
-            cross_attn_weights = None
+            # Get signals from context portion only (exclude generated)
+            need_attn = self.span_expr == "first_last_attn"
+            hidden_states, attentions = self._get_context_signals(
+                context_ids, context_mask, need_attn=need_attn
+            )
         else:
-            # Encoder-decoder generation
-            generated_ids, encoder_output, cross_attn_weights = self._generate_encdec(
+            # Encoder-decoder: generate with cross-attention capture
+            need_attn = self.span_expr == "first_last_attn"
+            generated_ids, hidden_states, attentions = self._generate_encdec(
                 encoder_input_ids,
                 encoder_attention_mask,
                 tokenizer,
                 max_new_tokens,
                 decoder_prefix_ids,
-                return_attn=(self.span_expr == "first_last_attn"),
+                return_attn=need_attn,
             )
 
-        # Step 2: Resolve span (if span extraction mode)
+        # No span extraction - just return generated tokens
         if self.span_expr == "none":
             return generated_ids
 
-        if self.model_type == "dec":
-            return self._resolve_span_dec(
-                input_ids, attention_mask, generated_ids, tokenizer
+        # === Step 2: Resolve span indices ===
+        # Parse anchors from generated sequence (skip for bertlike)
+        if generated_ids is not None:
+            first_anchors, last_anchors = self._parse_anchors(
+                generated_ids, tokenizer, debug
             )
         else:
-            return self._resolve_span_encdec(
-                encoder_input_ids,
-                encoder_attention_mask,
-                encoder_output,
-                generated_ids,
-                cross_attn_weights,
-                tokenizer,
+            first_anchors = last_anchors = None
+
+        # Calculate span logits from signals
+        start_logits, end_logits = self._compute_span_logits(
+            hidden_states, attentions, generated_ids
+        )
+
+        # Find best start/end indices using anchors + logits
+        start_indices, end_indices = self._resolve_span_indices(
+            context_ids,
+            start_logits,
+            end_logits,
+            first_anchors,
+            last_anchors,
+            tokenizer,
+            debug,
+        )
+
+        return start_indices, end_indices
+
+    def _get_context_signals(self, input_ids, attention_mask, need_attn=False):
+        """Get hidden states and optionally attention from context.
+
+        Returns:
+            (hidden_states, attentions) - attentions is None if not needed
+        """
+        if self.model_type == "dec":
+            outputs = self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                output_attentions=need_attn,
             )
+            hidden_states = outputs.hidden_states[-1]
+            attentions = outputs.attentions if need_attn else None
+        else:
+            # Encoder-decoder: run encoder
+            hidden_states = self._run_encoder(input_ids, attention_mask)
+            attentions = None  # Cross-attention captured during generation
+        return hidden_states, attentions
+
+    def _compute_span_logits(self, hidden_states, attentions, generated_ids):
+        """Compute start/end logits from hidden states or attention.
+
+        Returns:
+            (start_logits, end_logits) each shape (batch, context_len)
+        """
+        if self.span_expr in ("bertlike", "first_last_hidden"):
+            # Hidden-state based: linear projection
+            span_logits = self.qa_outputs(hidden_states.float())
+            start_logits, end_logits = span_logits.split(1, dim=-1)
+            return start_logits.squeeze(-1), end_logits.squeeze(-1)
+        else:  # first_last_attn
+            # Attention-based: weighted sum across layers/heads
+            if attentions is None:
+                raise ValueError("Attention weights required for first_last_attn mode")
+            dec_len = generated_ids.shape[1] if generated_ids is not None else 2
+            return self.attn_span_head(
+                attentions,
+                first_token_pos=1,
+                last_token_pos=max(1, dec_len - 2),
+            )
+
+    def _resolve_span_indices(
+        self,
+        context_ids,
+        start_logits,
+        end_logits,
+        first_anchors,
+        last_anchors,
+        tokenizer,
+        debug=False,
+    ):
+        """Find best start/end indices using anchors + logit disambiguation.
+
+        Returns:
+            (start_indices, end_indices) each shape (batch,)
+        """
+        batch_size = context_ids.shape[0]
+        device = context_ids.device
+        start_indices = []
+        end_indices = []
+
+        for i in range(batch_size):
+            ctx_ids = context_ids[i].tolist()
+
+            # Get candidate positions from anchors (or all positions if no anchors)
+            if first_anchors and first_anchors[i]:
+                start_candidates = [
+                    j for j, tok in enumerate(ctx_ids) if tok == first_anchors[i][0]
+                ]
+            else:
+                start_candidates = []
+
+            if last_anchors and last_anchors[i]:
+                end_candidates = [
+                    j for j, tok in enumerate(ctx_ids) if tok == last_anchors[i][-1]
+                ]
+            else:
+                end_candidates = []
+
+            # Select best start position
+            if start_candidates:
+                scores = start_logits[i][start_candidates]
+                start_idx = start_candidates[scores.argmax().item()]
+            else:
+                start_idx = start_logits[i].argmax().item()
+
+            # Select best end position (must be >= start)
+            if end_candidates:
+                valid_ends = [j for j in end_candidates if j >= start_idx]
+                if valid_ends:
+                    scores = end_logits[i][valid_ends]
+                    end_idx = valid_ends[scores.argmax().item()]
+                else:
+                    end_idx = start_idx
+            else:
+                end_idx = end_logits[i].argmax().item()
+                if end_idx < start_idx:
+                    end_idx = start_idx
+
+            start_indices.append(start_idx)
+            end_indices.append(end_idx)
+
+            if debug and i == 0 and tokenizer:
+                start_tok = tokenizer.decode([context_ids[i, start_idx].item()])
+                end_tok = tokenizer.decode([context_ids[i, end_idx].item()])
+                span_text = tokenizer.decode(
+                    context_ids[i, start_idx : end_idx + 1].tolist()
+                )
+                print(f"  Start idx: {start_idx}, token: '{start_tok}'")
+                print(f"  End idx: {end_idx}, token: '{end_tok}'")
+                print(f"  Extracted span: '{span_text}'")
+
+        return (
+            torch.tensor(start_indices, device=device),
+            torch.tensor(end_indices, device=device),
+        )
 
     @torch.no_grad()
     def _generate_encdec(
@@ -1240,11 +1468,13 @@ class UnifiedModel(nn.Module):
         """Encoder-decoder autoregressive generation.
 
         Returns:
-            (generated_ids, encoder_output, cross_attn_weights)
+            (generated_ids, hidden_states, attentions)
+            - hidden_states: encoder output (batch, enc_len, hidden_size)
+            - attentions: cross-attention weights if return_attn, else None
         """
         device = encoder_input_ids.device
         batch_size = encoder_input_ids.shape[0]
-        encoder_output = self._run_encoder(encoder_input_ids, encoder_attention_mask)
+        hidden_states = self._run_encoder(encoder_input_ids, encoder_attention_mask)
 
         # Initialize decoder
         if decoder_prefix_ids is not None:
@@ -1256,19 +1486,19 @@ class UnifiedModel(nn.Module):
             )
 
         eos_id = tokenizer.sep_token_id or tokenizer.eos_token_id
-        cross_attn_weights = None
+        attentions = None
 
         for _ in range(max_new_tokens):
             if return_attn:
-                logits, cross_attn_weights = self._run_custom_decoder(
+                logits, attentions = self._run_custom_decoder(
                     decoder_ids,
-                    encoder_output,
+                    hidden_states,
                     encoder_attention_mask,
                     return_attn=True,
                 )
             else:
                 logits = self._run_custom_decoder(
-                    decoder_ids, encoder_output, encoder_attention_mask
+                    decoder_ids, hidden_states, encoder_attention_mask
                 )
 
             next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -1277,77 +1507,9 @@ class UnifiedModel(nn.Module):
             if eos_id and (next_token == eos_id).all():
                 break
 
-        return decoder_ids, encoder_output, cross_attn_weights
+        return decoder_ids, hidden_states, attentions
 
-    @torch.no_grad()
-    def _resolve_span_dec(self, input_ids, attention_mask, generated_ids, tokenizer):
-        """Resolve span for decoder-only models."""
-        # Get hidden states
-        outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        hidden_states = outputs.hidden_states[-1]
-
-        # Get span logits
-        span_logits = self.qa_outputs(hidden_states.float())
-        start_logits, end_logits = span_logits.squeeze(-1).split(1, dim=-1)
-        start_logits = start_logits.squeeze(-1)
-        end_logits = end_logits.squeeze(-1)
-
-        # For first_last modes, parse anchors from generated_ids
-        if self.span_expr.startswith("first_last") and generated_ids is not None:
-            first_anchors, last_anchors = self._parse_anchors(generated_ids, tokenizer)
-            return self._resolve_with_anchors(
-                input_ids, start_logits, end_logits, first_anchors, last_anchors
-            )
-        else:
-            # bertlike: pure logits
-            return self._logits_to_spans(input_ids, start_logits, end_logits)
-
-    @torch.no_grad()
-    def _resolve_span_encdec(
-        self,
-        encoder_input_ids,
-        encoder_attention_mask,
-        encoder_output,
-        generated_ids,
-        cross_attn_weights,
-        tokenizer,
-    ):
-        """Resolve span for encoder-decoder models."""
-        # Get encoder output if not provided (bertlike case)
-        if encoder_output is None:
-            encoder_output = self._run_encoder(
-                encoder_input_ids, encoder_attention_mask
-            )
-
-        # Get span logits based on mode
-        if self.span_expr in ("bertlike", "first_last_hidden"):
-            span_logits = self.qa_outputs(encoder_output.float())
-            start_logits, end_logits = span_logits.squeeze(-1).split(1, dim=-1)
-            start_logits = start_logits.squeeze(-1)
-            end_logits = end_logits.squeeze(-1)
-        else:  # first_last_attn
-            dec_len = generated_ids.shape[1]
-            start_logits, end_logits = self.attn_span_head(
-                cross_attn_weights,
-                first_token_pos=1,
-                last_token_pos=max(1, dec_len - 2),
-            )
-
-        # For first_last modes, parse anchors and filter candidates
-        if self.span_expr.startswith("first_last") and generated_ids is not None:
-            first_anchors, last_anchors = self._parse_anchors(generated_ids, tokenizer)
-            return self._resolve_with_anchors(
-                encoder_input_ids, start_logits, end_logits, first_anchors, last_anchors
-            )
-        else:
-            # bertlike: pure logits
-            return self._logits_to_spans(encoder_input_ids, start_logits, end_logits)
-
-    def _parse_anchors(self, generated_ids, tokenizer):
+    def _parse_anchors(self, generated_ids, tokenizer, debug: bool = False):
         """Parse first/last anchor tokens from generated sequence.
 
         Expected structure: [CLS] [SPAN] first_anchor(s) ... last_anchor(s) [EOS]
@@ -1375,58 +1537,16 @@ class UnifiedModel(nn.Module):
                 first_anchors.append(anchor)
                 last_anchors.append(anchor)
 
+            if debug and i == 0:  # Only show first sample
+                print(f"  Output seq: {tokenizer.decode(seq)}")
+                print(
+                    f"  First anchor ids: {first_anchors[-1]} -> '{tokenizer.decode(first_anchors[-1])}'"
+                )
+                print(
+                    f"  Last anchor ids: {last_anchors[-1]} -> '{tokenizer.decode(last_anchors[-1])}'"
+                )
+
         return first_anchors, last_anchors
-
-    def _resolve_with_anchors(
-        self, input_ids, start_logits, end_logits, first_anchors, last_anchors
-    ):
-        """Resolve span using anchor filtering + logit disambiguation."""
-        batch_size = input_ids.shape[0]
-        device = input_ids.device
-        spans = []
-
-        for i in range(batch_size):
-            enc_ids = input_ids[i].tolist()
-            first_anchor = first_anchors[i]
-            last_anchor = last_anchors[i]
-
-            # Find candidate positions matching anchor tokens
-            if first_anchor:
-                start_candidates = [
-                    j for j, tok in enumerate(enc_ids) if tok == first_anchor[0]
-                ]
-            else:
-                start_candidates = list(range(len(enc_ids)))
-
-            if last_anchor:
-                end_candidates = [
-                    j for j, tok in enumerate(enc_ids) if tok == last_anchor[-1]
-                ]
-            else:
-                end_candidates = list(range(len(enc_ids)))
-
-            # Use logits to select best among candidates
-            if start_candidates:
-                start_scores = start_logits[i][start_candidates]
-                start_idx = start_candidates[start_scores.argmax().item()]
-            else:
-                start_idx = start_logits[i].argmax().item()
-
-            if end_candidates:
-                valid_end = [j for j in end_candidates if j >= start_idx]
-                if valid_end:
-                    end_scores = end_logits[i][valid_end]
-                    end_idx = valid_end[end_scores.argmax().item()]
-                else:
-                    end_idx = start_idx
-            else:
-                end_idx = end_logits[i].argmax().item()
-                if end_idx < start_idx:
-                    end_idx = start_idx
-
-            spans.append(input_ids[i, start_idx : end_idx + 1])
-
-        return self._pad_spans(spans, device)
 
     def _find_subsequence(self, seq: List[int], subseq: List[int]) -> Optional[int]:
         """Find starting index of subsequence in sequence."""
@@ -1434,27 +1554,6 @@ class UnifiedModel(nn.Module):
             if seq[i : i + len(subseq)] == subseq:
                 return i
         return None
-
-    def _logits_to_spans(self, input_ids, start_logits, end_logits):
-        """Convert logits to extracted spans (no anchor filtering)."""
-        batch_size = input_ids.shape[0]
-        spans = []
-        for i in range(batch_size):
-            start_idx = start_logits[i].argmax().item()
-            end_idx = end_logits[i].argmax().item()
-            if end_idx < start_idx:
-                end_idx = start_idx
-            spans.append(input_ids[i, start_idx : end_idx + 1])
-        return self._pad_spans(spans, input_ids.device)
-
-    def _pad_spans(self, spans: List[torch.Tensor], device) -> torch.Tensor:
-        """Pad list of span tensors to same length."""
-        batch_size = len(spans)
-        max_span_len = max(s.shape[0] for s in spans)
-        padded = torch.zeros(batch_size, max_span_len, dtype=torch.long, device=device)
-        for i, span in enumerate(spans):
-            padded[i, : span.shape[0]] = span
-        return padded
 
 
 # ============== Evaluation Helpers ==============
@@ -1616,7 +1715,7 @@ def evaluate_generation(
                 attention_mask = attention_mask[:, :prompt_len]
 
         with torch.no_grad():
-            output_ids = model.generate(
+            output = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 encoder_input_ids=encoder_input_ids,
@@ -1631,12 +1730,17 @@ def evaluate_generation(
 
         # Decode output
         if model.span_expr != "none":
-            # Span extraction: output is the extracted span
-            pred = tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+            # Span extraction: output is (start_indices, end_indices)
+            start_idx, end_idx = output[0].item(), output[1].item()
+            context_ids = (
+                encoder_input_ids if model.model_type == "encdec" else input_ids
+            )
+            span_ids = context_ids[0, start_idx : end_idx + 1]
+            pred = tokenizer.decode(span_ids, skip_special_tokens=True).strip()
         else:
             # Generation: skip prefix tokens
             pred = tokenizer.decode(
-                output_ids[0, prompt_len:], skip_special_tokens=True
+                output[0, prompt_len:], skip_special_tokens=True
             ).strip()
 
         predictions.append(pred)
@@ -1678,6 +1782,14 @@ def main():
         default=0.0,
         help="Fraction of bottom encoder layers with local attention (no cross-SEP). "
         "0.0=all global (default), 1.0=all local. E.g., 0.5 with 22 layers means bottom 11 are local.",
+    )
+    parser.add_argument(
+        "--enc_local_mask_type",
+        type=str,
+        default="segment",
+        choices=["segment", "block_causal"],
+        help="Local attention mask type: 'segment' (bidirectional per segment), "
+        "'block_causal' (seg1 bidirectional blocked from seg2, seg2 causal sees all).",
     )
     parser.add_argument(
         "--model_type",
@@ -1748,20 +1860,20 @@ def main():
     print(f"Data format: {args.data_format}")
     print(f"Model: {resolved_model_name}")
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(resolved_model_name)
-    infer_special_tokens(tokenizer)
-
-    # Add [SPAN] special token for span extraction modes
-    if parsed_format.is_span_extraction:
-        special_tokens = getattr(tokenizer, "additional_special_tokens", None) or []
-        if "[SPAN]" not in special_tokens:
-            tokenizer.add_special_tokens(
-                {"additional_special_tokens": special_tokens + ["[SPAN]"]}
-            )
-            print(
-                f"Added [SPAN] special token (id: {tokenizer.convert_tokens_to_ids('[SPAN]')})"
-            )
+    # Create model (handles tokenizer setup including special tokens)
+    print("Loading model...")
+    model = UnifiedModel(
+        model_name=resolved_model_name,
+        model_type=args.model_type,
+        span_expr=args.span_expr,
+        num_decoder_layers=args.num_decoder_layers,
+        max_seq_len=args.dec_max_length,
+        span_loss_weight=args.span_loss_weight,
+        enc_local_layer_ratio=args.enc_local_layer_ratio,
+        enc_local_mask_type=args.enc_local_mask_type,
+        add_span_token=parsed_format.is_span_extraction,
+    )
+    tokenizer = model.tokenizer
 
     # Load dataset
     print("Loading SQuAD dataset...")
@@ -1814,9 +1926,8 @@ def main():
             print(f"\n{key}:")
             print(f"  IDs: {value[:50]}{'...' if len(value) > 50 else ''}")
             print(f"  Tokens: {tokens[:50]}{'...' if len(tokens) > 50 else ''}")
-            print(
-                f"  Decoded: {tokenizer.decode(value, skip_special_tokens=False)[:200]}..."
-            )
+            decoded = tokenizer.decode(value, skip_special_tokens=False)
+            print(f"  Decoded: {decoded[:200]}{'...' if len(decoded) > 200 else ''}")
         elif key == "labels":
             # Labels contain -100 for ignored positions, filter those for decoding
             valid_ids = [v for v in value if v != -100]
@@ -1824,9 +1935,13 @@ def main():
             print(f"\n{key}:")
             print(f"  IDs: {value[:50]}{'...' if len(value) > 50 else ''}")
             print(f"  Valid tokens: {tokens[:50]}{'...' if len(tokens) > 50 else ''}")
-            print(
-                f"  Decoded (valid only): {tokenizer.decode(valid_ids, skip_special_tokens=False)[:200] if valid_ids else '(empty)'}..."
-            )
+            if valid_ids:
+                decoded = tokenizer.decode(valid_ids, skip_special_tokens=False)
+                print(
+                    f"  Decoded (valid only): {decoded[:200]}{'...' if len(decoded) > 200 else ''}"
+                )
+            else:
+                print("  Decoded (valid only): (empty)")
         elif "mask" in key:
             print(f"\n{key}: len={len(value)}, sum={sum(value)}")
 
@@ -1872,21 +1987,6 @@ def main():
     )
 
     print(f"Train: {len(train_features)}, Val: {len(val_features)}")
-
-    # Create model
-    print("Loading model...")
-    model = UnifiedModel(
-        model_name=resolved_model_name,
-        model_type=args.model_type,
-        span_expr=args.span_expr,
-        num_decoder_layers=args.num_decoder_layers,
-        max_seq_len=args.dec_max_length,
-        span_loss_weight=args.span_loss_weight,
-        # Only resize embeddings if we added [SPAN] token
-        vocab_size=len(tokenizer) if parsed_format.is_span_extraction else None,
-        enc_local_layer_ratio=args.enc_local_layer_ratio,
-        sep_token_id=tokenizer.sep_token_id,
-    )
 
     # Initialize custom decoder weights with lingua-style initialization
     model.init_weights()
