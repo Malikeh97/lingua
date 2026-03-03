@@ -53,13 +53,13 @@ if [[ $(hostname) == klogin* ]]; then
         local job_name="$1"
         local command="$2"
         should_skip_job "$job_name" && return 0
-        sbatch --job-name="$job_name" --output="logs/$job_name.out" --error="logs/$job_name.out" setup/submit_killarney.sbatch "$command"
+        sbatch --job-name="$job_name" --output="logs/%j_$job_name.out" --error="logs/%j_$job_name.out" setup/submit_killarney.sbatch "$command"
     }
     function submit_h100() {
         local job_name="$1"
         local command="$2"
         should_skip_job "$job_name" && return 0
-        sbatch --job-name="$job_name" --output="logs/$job_name.out" --error="logs/$job_name.out" setup/submit_killarney_h100.sbatch "$command"
+        sbatch --job-name="$job_name" --output="logs/%j_$job_name.out" --error="logs/%j_$job_name.out" setup/submit_killarney_h100.sbatch "$command"
     }
 elif [[ $(hostname) == vulcan* ]]; then
     # define job submission function (vulcan)
@@ -67,7 +67,7 @@ elif [[ $(hostname) == vulcan* ]]; then
         local job_name="$1"
         local command="$2"
         should_skip_job "$job_name" && return 0
-        sbatch --job-name="$job_name" --output="logs/$job_name.out" --error="logs/$job_name.out" setup/submit_vulcan.sbatch "$command"
+        sbatch --job-name="$job_name" --output="logs/%j_$job_name.out" --error="logs/%j_$job_name.out" setup/submit_vulcan.sbatch "$command"
     }
 elif [[ $(hostname) == trig* ]]; then
     # define job submission function (trillium)
@@ -75,7 +75,7 @@ elif [[ $(hostname) == trig* ]]; then
         local job_name="$1"
         local command="$2"
         should_skip_job "$job_name" && return 0
-        sbatch --job-name="$job_name" --output="logs/$job_name.out" --error="logs/$job_name.out" setup/submit_h100_trillium.sbatch "$command"
+        sbatch --job-name="$job_name" --output="logs/%j_$job_name.out" --error="logs/%j_$job_name.out" setup/submit_h100_trillium.sbatch "$command"
     }
 elif [[ $(hostname) == login* ]]; then
     # define job submission function (fir)
@@ -83,7 +83,7 @@ elif [[ $(hostname) == login* ]]; then
         local job_name="$1"
         local command="$2"
         should_skip_job "$job_name" && return 0
-        sbatch --job-name="$job_name" --output="logs/$job_name.out" --error="logs/$job_name.out" setup/submit_h100_fir.sbatch "$command"
+        sbatch --job-name="$job_name" --output="logs/%j_$job_name.out" --error="logs/%j_$job_name.out" setup/submit_h100_fir.sbatch "$command"
     }
 else
     echo "Unknown hostname: $(hostname) - cannot define submit function"

@@ -773,6 +773,221 @@ class CrossAttentionAdapter(nn.Module):
         nn.init.zeros_(self.cross_attn_norm.bias)
 
 
+class LinearCrossAttentionAdapter(nn.Module):
+    """Linear-complexity cross-attention adapter for CEPE.
+
+    Supports two variants:
+      - "linear": Parallel S = K^T V encoding (O(enc_len) memory state).
+      - "linear_kda": Sequential KDA-style delta-rule recurrence over encoder tokens.
+
+    Both variants zero-init out_proj.weight so the adapter starts as a no-op,
+    preserving the pre-trained decoder's behavior at initialization.
+    Returns the same API as CrossAttentionAdapter.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        variant: str = "linear",
+    ):
+        super().__init__()
+        assert variant in ("linear", "linear_kda"), f"Unknown variant: {variant!r}"
+        self.variant = variant
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+
+        self.cross_attn_norm = nn.LayerNorm(hidden_size)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        if variant == "linear_kda":
+            # FLA-style: direct D → H*d_k projection for per-element log-space decay gates.
+            # logsigmoid output is always ≤ 0, so exp(g) ≤ 1 (guaranteed decay).
+            # Replaces the old rank-bottleneck alpha_down/alpha_up pair.
+            self.g_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=True)
+            self.beta_proj = nn.Linear(hidden_size, num_heads, bias=True)
+            # Zero-init: logsigmoid(0) = -log2 ≈ -0.693 → moderate initial decay rate
+            nn.init.zeros_(self.g_proj.weight)
+            nn.init.zeros_(self.g_proj.bias)
+
+        # Zero-init output projection: adapter starts as identity (no-op)
+        nn.init.zeros_(self.out_proj.weight)
+
+    def _feature_map(self, x):
+        """Swish activation followed by L2 normalization along head_dim."""
+        x = torch.nn.functional.silu(x)
+        return torch.nn.functional.normalize(x, p=2, dim=-1)
+
+    def forward(self, x, encoder_output, encoder_padding_mask=None, return_attn=False):
+        """
+        Args:
+            x: decoder hidden states [B, T_dec, D]
+            encoder_output: encoder hidden states [B, T_enc, D]
+            encoder_padding_mask: bool tensor [B, T_enc], True = valid token
+            return_attn: if True, returns (output, None) — no explicit weights for linear
+        """
+        residual = x
+        x = self.cross_attn_norm(x)
+
+        B, T_dec, D = x.shape
+        T_enc = encoder_output.shape[1]
+        H = self.num_heads
+        d_k = self.head_dim
+
+        # Project Q, K, V and reshape to (B, H, T, d_k)
+        Q = self.q_proj(x).view(B, T_dec, H, d_k).transpose(1, 2)           # (B, H, T_dec, d_k)
+        K = self.k_proj(encoder_output).view(B, T_enc, H, d_k).transpose(1, 2)  # (B, H, T_enc, d_k)
+        V = self.v_proj(encoder_output).view(B, T_enc, H, d_k).transpose(1, 2)  # (B, H, T_enc, d_k)
+
+        # Apply feature maps
+        Q = self._feature_map(Q)   # (B, H, T_dec, d_k)
+        K = self._feature_map(K)   # (B, H, T_enc, d_k)
+        V = torch.nn.functional.silu(V)  # (B, H, T_enc, d_k)
+
+        if self.variant == "linear":
+            # Zero-out padded encoder positions before accumulation
+            if encoder_padding_mask is not None:
+                # mask: (B, 1, T_enc, 1) — True=valid
+                mask = encoder_padding_mask[:, None, :, None].to(K.dtype)
+                K = K * mask
+                V = V * mask
+
+            # S = K^T @ V  (B, H, d_k, d_k)
+            S = torch.matmul(K.transpose(-2, -1), V)
+            # z = sum of K over enc positions (B, H, d_k)
+            z = K.sum(dim=2)
+
+            # O = Q @ S  (B, H, T_dec, d_k)
+            O = torch.matmul(Q, S)
+            # Normalize
+            denom = torch.matmul(Q, z.unsqueeze(-1)).clamp(min=1e-6)  # (B, H, T_dec, 1)
+            O = O / denom
+
+        else:  # linear_kda: chunked delta-rule recurrence (inspired by FLA naive_chunk_kda)
+            #
+            # Gate design (FLA convention):
+            #   g_log = logsigmoid(g_proj(enc))  → per-element, log-space, always ≤ 0
+            #   exp(g_log) ≤ 1 everywhere → guaranteed exponential decay
+            #   This replaces the old sigmoid-bottleneck alpha_down/alpha_up.
+            #
+            # Recurrence design (replaces TBPTT):
+            #   Within each chunk of BT=64 tokens: exact delta-rule via an intra-chunk
+            #   interaction matrix A and forward substitution (O(BT^2) ops, no Python loop
+            #   over tokens).  Across NT = T_enc/64 chunks: sequential S propagation.
+            #   Autograd graph depth = O(NT) ≈ 8 instead of O(T_enc) ≈ 512.
+            #   Memory: O(num_adapters * BT^2) instead of O(num_adapters * T_enc * d_k^2).
+            #   Gradients are EXACT (no truncation).
+
+            # Log-space per-element decay gates: [B, T_enc, H*d_k] → [B, H, T_enc, d_k]
+            g_log = F.logsigmoid(self.g_proj(encoder_output))
+            g_log = g_log.view(B, T_enc, H, d_k).permute(0, 2, 1, 3)   # [B, H, T_enc, d_k]
+
+            # Per-head write gate: [B, T_enc, H] → [B, H, T_enc]
+            beta_val = torch.sigmoid(self.beta_proj(encoder_output))
+            beta_val = beta_val.permute(0, 2, 1)                         # [B, H, T_enc]
+
+            # Zero-out padded encoder positions before any accumulation
+            if encoder_padding_mask is not None:
+                pad_m = encoder_padding_mask[:, None, :, None].to(K.dtype)  # [B, 1, T_enc, 1]
+                K = K * pad_m
+                V = V * pad_m
+
+            # Chunked encoder state build
+            CHUNK = 64
+            S = K.new_zeros(B, H, d_k, d_k)
+
+            for t_start in range(0, T_enc, CHUNK):
+                t_end = min(t_start + CHUNK, T_enc)
+                BT = t_end - t_start
+
+                K_c = K[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
+                V_c = V[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
+                g_c = g_log[:, :, t_start:t_end, :]    # [B, H, BT, d_k]
+                b_c = beta_val[:, :, t_start:t_end]    # [B, H, BT]
+
+                # Intra-chunk cumulative gate (FLA: g_cum[i] = sum of log-gates 0..i)
+                g_cum = g_c.cumsum(dim=2)              # [B, H, BT, d_k]
+                K_g = K_c * g_cum.exp()                # gate-weighted keys [B, H, BT, d_k]
+
+                # Intra-chunk delta-rule interaction matrix (lower triangular):
+                # A[i, j] = K[i] · K_g[j]   for j < i,   0 otherwise
+                A = torch.matmul(K_c, K_g.transpose(-2, -1))   # [B, H, BT, BT]
+                A = A * b_c.unsqueeze(-1)                       # row-wise beta scale
+
+                # Mask to strictly lower triangular and negate (for the linear solve)
+                upper = torch.triu(
+                    torch.ones(BT, BT, dtype=torch.bool, device=K.device), diagonal=0
+                )
+                A = (-A).masked_fill(upper[None, None], 0.0)
+
+                # Exact forward substitution: A → (I - L)^{-1} - I
+                # For a BT×BT strictly lower-triangular L the Neumann series terminates
+                # after BT steps, so this loop produces the exact matrix inverse.
+                for i in range(1, BT):
+                    A[:, :, i, :i] = (
+                        A[:, :, i, :i].clone()
+                        + (A[:, :, i:i+1, :].clone() @ A.clone())[:, :, 0, :i]
+                    )
+
+                # A_inv = (I - L)^{-1} scaled by beta (FLA convention)
+                A = (A + torch.eye(BT, device=K.device, dtype=K.dtype)[None, None]) * b_c.unsqueeze(-1)
+
+                # Inter-chunk aggregates
+                w = torch.matmul(A, K_g)    # [B, H, BT, d_k]  — effective key sum
+                u = torch.matmul(A, V_c)    # [B, H, BT, d_k]  — effective value sum
+
+                # Core delta: subtract what S already encodes (the "delta" in delta-rule)
+                v_new = u - torch.matmul(w, S)          # [B, H, BT, d_k]
+
+                # State update: decay S by end-of-chunk gate, then add new associations
+                g_last = g_cum[:, :, -1, :]             # [B, H, d_k]
+                S = S * g_last.exp().unsqueeze(-1)      # [B, H, d_k, 1] → decay key rows
+                K_w = K_c * (g_last[:, :, None, :] - g_cum).exp()   # [B, H, BT, d_k]
+                S = S + torch.matmul(K_w.transpose(-2, -1), v_new)  # [B, H, d_k, d_k]
+
+            # Decode: all decoder queries read from the final encoder state.
+            # Q and K are L2-normalised by _feature_map, providing implicit normalisation.
+            O = torch.matmul(Q, S)                      # [B, H, T_dec, d_k]
+
+        # Merge heads and project
+        O = O.transpose(1, 2).contiguous().view(B, T_dec, D)  # (B, T_dec, D)
+        O = self.dropout(O)
+        O = self.out_proj(O)
+
+        output = residual + O
+        if return_attn:
+            return output, None
+        return output
+
+    def init_weights(self, init_std: float, factor: float):
+        """Init Q/K/V with trunc_normal; out_proj zero; KDA gates zero; LayerNorm ones/zeros."""
+
+        def tn(w, std):
+            nn.init.trunc_normal_(w, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+        tn(self.q_proj.weight, init_std)
+        tn(self.k_proj.weight, init_std)
+        tn(self.v_proj.weight, init_std)
+        # Output proj: zero (CEPE-style identity start)
+        nn.init.zeros_(self.out_proj.weight)
+
+        if self.variant == "linear_kda":
+            # g_proj already zero-inited in __init__; reinforce here for robustness
+            nn.init.zeros_(self.g_proj.weight)
+            nn.init.zeros_(self.g_proj.bias)
+            nn.init.zeros_(self.beta_proj.weight)
+            nn.init.zeros_(self.beta_proj.bias)
+
+        nn.init.ones_(self.cross_attn_norm.weight)
+        nn.init.zeros_(self.cross_attn_norm.bias)
+
+
 class AttentionSpanHead(nn.Module):
     """Learns to extract span positions from cross-attention weights.
 
@@ -857,6 +1072,7 @@ class UnifiedModel(nn.Module):
         sep_token_id: int = None,
         decoder_model_name: str = None,
         cross_attn_num_heads: int = 16,
+        cross_attn_type: str = "softmax",
     ):
         """
         Args:
@@ -867,6 +1083,7 @@ class UnifiedModel(nn.Module):
             decoder_model_name: Pre-trained model to use as decoder (e.g., 'tinyllama_1b').
                 When set with model_type='encdec', uses pre-trained decoder with cross-attention adapters.
             cross_attn_num_heads: Number of attention heads for cross-attention adapters.
+            cross_attn_type: Cross-attention adapter type: 'softmax' (default), 'linear', or 'linear_kda'.
         """
         super().__init__()
         model_name = resolve_model_name(model_name)
@@ -877,6 +1094,15 @@ class UnifiedModel(nn.Module):
         self.use_pretrained_decoder = bool(decoder_model_name)
         self.enc_local_layer_ratio = enc_local_layer_ratio
         self.sep_token_id = sep_token_id
+        self.cross_attn_type = cross_attn_type
+
+        if cross_attn_type != "softmax" and span_expr == "first_last_attn":
+            raise AssertionError(
+                f"cross_attn_type={cross_attn_type!r} is incompatible with "
+                "span_expr='first_last_attn' (linear attention produces no explicit "
+                "attention weight matrices). Use span_expr='none', 'bertlike', or "
+                "'first_last_hidden'."
+            )
 
         config = AutoConfig.from_pretrained(model_name)
         if hasattr(config, "attn_implementation"):
@@ -910,7 +1136,7 @@ class UnifiedModel(nn.Module):
         if model_type == "encdec" and span_expr != "bertlike":
             if decoder_model_name:
                 self._init_pretrained_decoder(
-                    decoder_model_name, cross_attn_num_heads, dropout
+                    decoder_model_name, cross_attn_num_heads, dropout, cross_attn_type
                 )
             else:
                 self._init_decoder(num_decoder_layers, num_heads, dropout, max_seq_len)
@@ -965,7 +1191,9 @@ class UnifiedModel(nn.Module):
         self.output_proj = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
         self.output_proj.weight = self.decoder_embed.weight
 
-    def _init_pretrained_decoder(self, decoder_model_name, cross_attn_num_heads, dropout):
+    def _init_pretrained_decoder(
+        self, decoder_model_name, cross_attn_num_heads, dropout, cross_attn_type: str = "softmax"
+    ):
         """Initialize decoder from a pre-trained causal LM with cross-attention adapters.
 
         Loads a pre-trained model (e.g., TinyLlama) and extracts its components.
@@ -1006,11 +1234,16 @@ class UnifiedModel(nn.Module):
         )
 
         # Cross-attention adapters: one per decoder layer
+        if cross_attn_type == "softmax":
+            adapter_cls = CrossAttentionAdapter
+            adapter_kwargs = {}
+        else:
+            adapter_cls = LinearCrossAttentionAdapter
+            adapter_kwargs = {"variant": cross_attn_type}
+
         self.cross_attn_adapters = nn.ModuleList(
             [
-                CrossAttentionAdapter(
-                    self.decoder_hidden_size, cross_attn_num_heads, dropout
-                )
+                adapter_cls(self.decoder_hidden_size, cross_attn_num_heads, dropout, **adapter_kwargs)
                 for _ in range(self.decoder_num_layers)
             ]
         )
@@ -2044,6 +2277,16 @@ def main():
         default=16,
         help="Number of attention heads for cross-attention adapters (default: 16)",
     )
+    parser.add_argument(
+        "--cross_attn_type",
+        type=str,
+        default="softmax",
+        choices=["softmax", "linear", "linear_kda"],
+        help=(
+            "Cross-attention adapter type: 'softmax' (default, nn.MHA), "
+            "'linear' (parallel S=K^TV), 'linear_kda' (KDA delta-rule recurrence)."
+        ),
+    )
     parser.add_argument("--max_length", type=int, default=8192)
     parser.add_argument("--dec_max_length", type=int, default=8192)
     parser.add_argument(
@@ -2246,6 +2489,7 @@ def main():
         sep_token_id=tokenizer.sep_token_id,
         decoder_model_name=args.decoder_model_name,
         cross_attn_num_heads=args.cross_attn_num_heads,
+        cross_attn_type=args.cross_attn_type,
     )
 
     # Initialize custom decoder weights with lingua-style initialization
