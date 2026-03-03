@@ -66,6 +66,54 @@ O     =  O / denom
 
 Instead of adding all encoder tokens uniformly, this variant processes them with a gated delta-rule write: each new token corrects the memory only for what it adds above what is already encoded. The implementation is adapted from the [flash-linear-attention](https://github.com/sustcsonglin/flash-linear-attention) KDA ops (`fla/ops/kda/naive.py`), rearchitected for an encoder-only state build followed by decoder cross-read.
 
+---
+
+## Plain-Language Comparison
+
+Both modes compress the entire encoder sequence into a fixed matrix **S** that the decoder reads from. The difference is *how* S is built.
+
+---
+
+**`linear` — "just add everything up"**
+
+For each encoder token, take its key **k** and value **v**, form the outer product, and add it to S:
+```
+S = K^T @ V   (one parallel matmul — all tokens at once)
+```
+Every token contributes equally. No token can "overwrite" or "forget" an earlier one. It's like taking notes where you write every word with equal ink — the final page is the sum of all words, with nothing erased.
+
+---
+
+**`linear_kda` — "write, but correct for what's already there"**
+
+Processes tokens one chunk at a time. Before writing token **t**, it *reads back* what S already says about that key, computes the error (the "delta"), and only writes the correction:
+```
+retrieved = k_t @ S              # what does S already know about k_t?
+delta     = v_t - retrieved      # what's new / what needs correcting?
+S        += beta * k_t ⊗ delta   # write only the correction
+```
+Additionally, **old associations decay** (via the `g` gate) before each new token is written — so tokens written long ago fade out gradually.
+
+It's like taking notes where before writing something new, you check if you've already written it, and only add what's missing. Plus old notes fade slightly over time.
+
+---
+
+**Comparison**
+
+| | `linear` | `linear_kda` |
+|---|---|---|
+| Build S | One parallel matmul | Chunked sequential (8 steps for T=512) |
+| Can tokens overwrite old ones? | No — pure accumulation | Yes — via decay gate |
+| Can a token correct a prior write? | No | Yes — via delta rule |
+| Memory for training | O(1) — no loop | O(BT²) — 8 small chunk matrices |
+| Speed (build) | Fastest — single op | Slower — 8 chunk iterations |
+| Expressiveness | Lower — all tokens equal | Higher — recency + correction |
+| Parameters | Q/K/V/O only | + `g_proj` (decay) + `beta_proj` (write gate) |
+
+**Bottom line**: `linear` is simpler and faster but treats all encoder tokens uniformly. `linear_kda` can model *which* tokens matter more (via decay) and *avoids redundant writes* (via delta), at the cost of sequential chunk processing and more parameters.
+
+---
+
 ### Additional Parameters
 
 ```
