@@ -55,6 +55,16 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+import os as _os, sys as _sys
+_fla_path = _os.path.join(_os.path.dirname(__file__), "flash-linear-attention")
+if _fla_path not in _sys.path:
+    _sys.path.insert(0, _fla_path)
+try:
+    from fla.ops.kda import chunk_kda as _chunk_kda
+    _FLA_AVAILABLE = True
+except ImportError:
+    _FLA_AVAILABLE = False
+
 
 # ============== Data Preparation ==============
 
@@ -898,58 +908,84 @@ class LinearCrossAttentionAdapter(nn.Module):
                 K = K * pad_m
                 V = V * pad_m
 
-            # Chunked encoder state build
-            CHUNK = 64
-            S = K.new_zeros(B, H, d_k, d_k)
+            if _FLA_AVAILABLE:
+                # ── Fast path: single fused CUDA kernel via flash-linear-attention ──
+                # Convert [B, H, T, d_k] → [B, T, H, d_k] as expected by chunk_kda.
+                K_enc = K.permute(0, 2, 1, 3).contiguous()       # [B, T_enc, H, d_k]
+                V_enc = V.permute(0, 2, 1, 3).contiguous()       # [B, T_enc, H, d_k]
+                g_enc = g_log.permute(0, 2, 1, 3).contiguous()   # [B, T_enc, H, d_k]
+                b_enc = beta_val.permute(0, 2, 1).contiguous()   # [B, T_enc, H]
 
-            for t_start in range(0, T_enc, CHUNK):
-                t_end = min(t_start + CHUNK, T_enc)
-                BT = t_end - t_start
+                # chunk_kda requires float32 initial state
+                h0 = K.new_zeros(B, H, d_k, d_k, dtype=torch.float32)
 
-                K_c = K[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
-                V_c = V[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
-                g_c = g_log[:, :, t_start:t_end, :]    # [B, H, BT, d_k]
-                b_c = beta_val[:, :, t_start:t_end]    # [B, H, BT]
-
-                # Intra-chunk cumulative gate (FLA: g_cum[i] = sum of log-gates 0..i)
-                g_cum = g_c.cumsum(dim=2)              # [B, H, BT, d_k]
-                K_g = K_c * g_cum.exp()                # gate-weighted keys [B, H, BT, d_k]
-
-                # Intra-chunk delta-rule interaction matrix (lower triangular):
-                # A[i, j] = K[i] · K_g[j]   for j < i,   0 otherwise
-                A = torch.matmul(K_c, K_g.transpose(-2, -1))   # [B, H, BT, BT]
-                A = A * b_c.unsqueeze(-1)                       # row-wise beta scale
-
-                # Mask to strictly lower triangular and negate (for the linear solve)
-                upper = torch.triu(
-                    torch.ones(BT, BT, dtype=torch.bool, device=K.device), diagonal=0
+                # Q is only used to produce the intra-encoder output (which we discard);
+                # pass K_enc as a shape-compatible placeholder.
+                # scale=1.0: Q and K are already L2-normalised by _feature_map.
+                _, final_state = _chunk_kda(
+                    q=K_enc,
+                    k=K_enc,
+                    v=V_enc,
+                    g=g_enc,
+                    beta=b_enc,
+                    scale=1.0,
+                    initial_state=h0,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=False,
                 )
-                A = (-A).masked_fill(upper[None, None], 0.0)
+                # final_state: [B, H, d_k, d_k] (float32) — cast to match Q dtype
+                S = final_state.to(Q.dtype)
 
-                # Exact forward substitution: A → (I - L)^{-1} - I
-                # For a BT×BT strictly lower-triangular L the Neumann series terminates
-                # after BT steps, so this loop produces the exact matrix inverse.
-                for i in range(1, BT):
-                    A[:, :, i, :i] = (
-                        A[:, :, i, :i].clone()
-                        + (A[:, :, i:i+1, :].clone() @ A.clone())[:, :, 0, :i]
+            else:
+                # ── Fallback path: Python outer loop + batched triangular solve ──
+                # Inner forward-substitution loop replaced by a single
+                # torch.linalg.solve_triangular call (one batched CUDA LAPACK kernel).
+                CHUNK = 64
+                S = K.new_zeros(B, H, d_k, d_k)
+
+                for t_start in range(0, T_enc, CHUNK):
+                    t_end = min(t_start + CHUNK, T_enc)
+                    BT = t_end - t_start
+
+                    K_c = K[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
+                    V_c = V[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
+                    g_c = g_log[:, :, t_start:t_end, :]    # [B, H, BT, d_k]
+                    b_c = beta_val[:, :, t_start:t_end]    # [B, H, BT]
+
+                    # Intra-chunk cumulative gate
+                    g_cum = g_c.cumsum(dim=2)              # [B, H, BT, d_k]
+                    K_g = K_c * g_cum.exp()                # [B, H, BT, d_k]
+
+                    # Intra-chunk delta-rule interaction matrix (lower triangular)
+                    A = torch.matmul(K_c, K_g.transpose(-2, -1))   # [B, H, BT, BT]
+                    A = A * b_c.unsqueeze(-1)
+
+                    upper = torch.triu(
+                        torch.ones(BT, BT, dtype=torch.bool, device=K.device), diagonal=0
                     )
+                    A = (-A).masked_fill(upper[None, None], 0.0)
 
-                # A_inv = (I - L)^{-1} scaled by beta (FLA convention)
-                A = (A + torch.eye(BT, device=K.device, dtype=K.dtype)[None, None]) * b_c.unsqueeze(-1)
+                    # Exact (I - A)^{-1} via batched triangular solve — replaces the
+                    # 63-iteration Python forward-substitution loop.
+                    eye_BT = torch.eye(BT, device=K.device, dtype=K.dtype)
+                    # solve_triangular doesn't support bfloat16; cast to float32 and back
+                    _A = A.float()
+                    _eye = eye_BT.float()
+                    A = torch.linalg.solve_triangular(
+                        _eye[None, None] - _A,
+                        _eye[None, None].expand(B, H, -1, -1),
+                        upper=False,
+                    ).to(K.dtype) * b_c.unsqueeze(-1)
 
-                # Inter-chunk aggregates
-                w = torch.matmul(A, K_g)    # [B, H, BT, d_k]  — effective key sum
-                u = torch.matmul(A, V_c)    # [B, H, BT, d_k]  — effective value sum
+                    # Inter-chunk aggregates
+                    w = torch.matmul(A, K_g)
+                    u = torch.matmul(A, V_c)
+                    v_new = u - torch.matmul(w, S)
 
-                # Core delta: subtract what S already encodes (the "delta" in delta-rule)
-                v_new = u - torch.matmul(w, S)          # [B, H, BT, d_k]
-
-                # State update: decay S by end-of-chunk gate, then add new associations
-                g_last = g_cum[:, :, -1, :]             # [B, H, d_k]
-                S = S * g_last.exp().unsqueeze(-1)      # [B, H, d_k, 1] → decay key rows
-                K_w = K_c * (g_last[:, :, None, :] - g_cum).exp()   # [B, H, BT, d_k]
-                S = S + torch.matmul(K_w.transpose(-2, -1), v_new)  # [B, H, d_k, d_k]
+                    g_last = g_cum[:, :, -1, :]
+                    S = S * g_last.exp().unsqueeze(-1)
+                    K_w = K_c * (g_last[:, :, None, :] - g_cum).exp()
+                    S = S + torch.matmul(K_w.transpose(-2, -1), v_new)
 
             # Decode: all decoder queries read from the final encoder state.
             # Q and K are L2-normalised by _feature_map, providing implicit normalisation.
@@ -2077,10 +2113,12 @@ def _get_device(model):
     return next(model.parameters()).device
 
 
-def train_epoch(model, dataloader, optimizer, epoch, use_wandb):
+def train_epoch(model, dataloader, optimizer, epoch, use_wandb, eval_callback=None):
     model.train()
     device = _get_device(model)
     total_loss = 0
+    total_steps = len(dataloader)
+    eval_interval = max(1, total_steps // 10)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
 
     for step, batch in enumerate(pbar):
@@ -2094,6 +2132,13 @@ def train_epoch(model, dataloader, optimizer, epoch, use_wandb):
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         if use_wandb and step % 10 == 0:
             wandb.log({"train/loss": loss.item(), "train/step": step})
+
+        # Evaluate every 10% of the epoch steps (skip step 0)
+        if eval_callback is not None and step > 0 and step % eval_interval == 0:
+            pct = int(round(step / total_steps * 100))
+            pbar.write(f"\n[Epoch {epoch} | {pct}% ({step}/{total_steps})] Running validation...")
+            eval_callback(epoch=epoch, step=step, total_steps=total_steps)
+            model.train()
 
     return total_loss / len(dataloader)
 
@@ -2575,15 +2620,9 @@ def main():
         optimizer_grouped_parameters, lr=args.lr, weight_decay=0.01
     )
 
-    # Training loop
-    print("\nStarting training...")
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, epoch, use_wandb)
-        print(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
-
+    def run_squad_eval(epoch, step, total_steps):
+        """Run SQuAD validation and log results."""
         val_metrics = evaluate_loss(model, val_loader)
-        print(f"Epoch {epoch} - Val loss: {val_metrics['loss']:.4f}")
-
         gen_metrics, predictions, ground_truths = evaluate_generation(
             model,
             dataset["validation"],
@@ -2592,21 +2631,21 @@ def main():
             args.eval_samples,
             decoder_tokenizer=decoder_tokenizer,
         )
+        pct = int(round(step / total_steps * 100)) if total_steps > 0 else 100
         print(
-            f"Epoch {epoch} - EM: {gen_metrics['exact_match']:.2f}%, F1: {gen_metrics['f1']:.2f}%"
+            f"[Epoch {epoch} | {pct}%] Val loss: {val_metrics['loss']:.4f} | "
+            f"EM: {gen_metrics['exact_match']:.2f}% | F1: {gen_metrics['f1']:.2f}%"
         )
-
         if use_wandb:
             wandb.log(
                 {
                     "epoch": epoch,
-                    "train/epoch_loss": train_loss,
+                    "epoch_pct": pct,
                     "val/loss": val_metrics["loss"],
                     "val/exact_match": gen_metrics["exact_match"],
                     "val/f1": gen_metrics["f1"],
                 }
             )
-
         print("\n  Samples:")
         for i in range(min(3, len(predictions))):
             sample = dataset["validation"][i]
@@ -2615,6 +2654,23 @@ def main():
             print(f"    Gold: {gold}")
             print(f"    Pred: {predictions[i]}")
             print()
+        return val_metrics, gen_metrics
+
+    # Training loop
+    print("\nStarting training...")
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_epoch(
+            model, train_loader, optimizer, epoch, use_wandb, eval_callback=run_squad_eval
+        )
+        print(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
+
+        # End-of-epoch evaluation (100%)
+        val_metrics, gen_metrics = run_squad_eval(
+            epoch=epoch, step=len(train_loader), total_steps=len(train_loader)
+        )
+
+        if use_wandb:
+            wandb.log({"epoch": epoch, "train/epoch_loss": train_loss})
 
     print("\nTraining complete!")
     if use_wandb:

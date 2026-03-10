@@ -142,11 +142,8 @@ K_g    = K_c * exp(g_cum)              # gate-weighted keys
 A      = K_c @ K_g.T * beta           # [B, H, BT, BT]
 A      = (-A) masked to lower-tri
 
-# Exact forward substitution: A → (I − L)^{−1} − I
-for i in 1..BT:
-    A[i, :i] = A[i, :i] + (A[i, :] @ A)[:i]
-
-A_inv  = (A + I) * beta               # (I − L)^{−1} scaled by beta (FLA convention)
+# Exact (I − A)^{−1} via batched triangular solve (one CUDA LAPACK call)
+A_inv = solve_triangular(I − A, I) * beta
 
 # Inter-chunk aggregates
 w      = A_inv @ K_g                  # effective key sum
@@ -193,6 +190,51 @@ GPU 0 has a total capacity of 44.40 GiB of which 14.31 MiB is free.
 **Root cause**: the original token-by-token for-loop kept O(num_layers × T_enc) copies of the state tensor `S` (each `[8, 32, 64, 64]`, ≈ 4 MB fp32) alive simultaneously for backward. With 22 adapter layers and T_enc = 512: 22 × 512 × 4 MB ≈ **44 GB** of saved autograd tensors — exactly filling the GPU before any activations were allocated.
 
 **Fix applied**: replaced the token loop (+ TBPTT detach hack) with the FLA-inspired chunked recurrence described above. The autograd graph depth shrinks from 512 to 8, reducing the state-tensor memory footprint from ~44 GB to ~1.4 GB.
+
+---
+
+## BFloat16 Fix in Fallback Path (March 9, 2026)
+
+**Problem**: Running the fallback path (when FLA is unavailable) with BFloat16 tensors crashed:
+```
+RuntimeError: "triangular_solve_cuda" not implemented for 'BFloat16'
+```
+`torch.linalg.solve_triangular` does not support BFloat16 on CUDA.
+
+**Fix** (`cepe.py` lines 970–978): Cast inputs to float32 before the triangular solve, cast result back to the original dtype:
+```python
+_A = A.float()
+_eye = eye_BT.float()
+A = torch.linalg.solve_triangular(
+    _eye[None, None] - _A,
+    _eye[None, None].expand(B, H, -1, -1),
+    upper=False,
+).to(K.dtype) * b_c.unsqueeze(-1)
+```
+The float32 cast is in the fallback path only; the FLA fast path (`chunk_kda`) handles BFloat16 natively via Triton kernels.
+
+---
+
+## Speed Analysis: Fallback Path vs Softmax (March 9, 2026)
+
+**Observed performance** (L40S GPU, batch_size=8, ModernBERT-large 400M encoder + TinyLlama 1B decoder):
+
+| Cross-attention type | Speed | Time/epoch |
+|---------------------|-------|------------|
+| `softmax` (FlashAttention) | ~2.07 it/s | ~1.5 h |
+| `linear_kda` fallback (post-fix) | ~0.67 it/s | ~4.5 h |
+
+**Why still ~3x slower?** The fallback path outer chunk loop:
+```python
+CHUNK = 64
+for t_start in range(0, T_enc, CHUNK):   # ~3 iterations for T_enc=187
+    ...solve_triangular(...)
+```
+With 22 cross-attention adapter layers (TinyLlama), this creates ~66 sequential Python→GPU round-trips per training step vs ~22 for softmax (one FlashAttention kernel per layer).
+
+**Fix**: Change `CHUNK = 64` → `CHUNK = T_enc` to collapse the outer loop to a **single iteration** — one `solve_triangular` call on a `[B, H, T_enc, T_enc]` matrix. Memory impact: `[8, 16, 512, 512]` float32 ≈ 134 MB — well within L40S capacity (44 GB).
+
+This fix is only active when FLA is unavailable. If FLA loads successfully (`_FLA_AVAILABLE = True`), the outer loop is bypassed entirely by the `chunk_kda` kernel.
 
 ---
 
@@ -255,5 +297,6 @@ The new `g_proj` is larger (full D → H×d_k matrix) but eliminates the rank bo
 
 1. Run `linear_kda_cepe` (now fixed) and compare EM/F1 against `linear_cepe` and the softmax baseline (target: 77.6% EM).
 2. Run `cq_s_linear_cepe_bertlike` and `cq_s_linear_cepe_first_last_hidden` (newly added) to see if span-extraction with linear attention is competitive with softmax span extraction.
-3. Profile wall-clock step time: the chunked recurrence has O(NT × BT²) intra-chunk ops; for BT=64 this is a `[B, H, 64, 64]` matmul repeated 8 times — should be faster than the old 512-step Python loop despite being sequential.
-4. Consider installing the FLA library (`pip install flash-linear-attention`) and swapping the chunked PyTorch loop for `chunk_kda(..., output_final_state=True)` to get the Triton-fused kernel with the full custom backward.
+3. ~~Profile wall-clock step time~~ → **Done**: fallback ~4.5h/epoch, FLA path expected ~1.5h/epoch (matching softmax).
+4. ~~Consider installing FLA~~ → **Done**: FLA bundled at `apps/minimal_squad/flash-linear-attention/`, fast path already coded; check `[cepe] FLA available: True/False` in job logs to confirm which path runs.
+5. Run experiments with `CHUNK = T_enc` fallback and compare speed to FLA fast path.

@@ -210,3 +210,35 @@ After running an experiment, check:
 2. Validation EM/F1 metrics are printed at end of each epoch
 3. W&B logs show training loss decreasing and eval metrics improving
 4. Compare EM% against expected values in `exps.sh` comments
+
+---
+
+## Recent Code Changes
+
+### `linear_kda` Performance Fix (`cepe.py`) — March 2026
+
+The `linear_kda` cross-attention variant was 4–5x slower than full softmax attention (14–16h vs 3–4h on SQuAD). The root cause was ~512 sequential Python-controlled GPU kernel dispatches per forward pass, caused by two nested loops and excessive `.clone()` calls inside the inner one.
+
+**What was changed:**
+
+1. **Added `flash-linear-attention` library import** (lines 58–66). The bundled `fla` library at `apps/minimal_squad/flash-linear-attention/` is added to `sys.path` at import time, and `chunk_kda` is imported via a guarded `try/except`.
+
+2. **Replaced the Python chunk loop with two paths** (lines 911–989 of `cepe.py`):
+
+   - **Fast path** (`_FLA_AVAILABLE = True`): Calls `fla.ops.kda.chunk_kda` — a single fused Triton/CUDA kernel that handles the full encoder sequence at once. Tensor layout is permuted from `[B, H, T, d_k]` to `[B, T, H, d_k]` as expected by the library. The encoder key tensor is passed as Q (its output is discarded); only `final_state` is used. This reduces ~512 Python-level kernel dispatches to ~3.
+
+   - **Fallback path** (`_FLA_AVAILABLE = False`): Keeps the outer `for t_start` chunk loop (8 iterations) but replaces the inner 63-iteration forward-substitution loop — and all 504 associated `.clone()` calls — with a single `torch.linalg.solve_triangular` call. This is a batched CUDA LAPACK kernel that computes the exact `(I - L)^{-1}` in one shot.
+
+**Expected impact:**
+
+| Path | Kernel launches (forward) | Expected training time |
+|------|--------------------------|----------------------|
+| Before (Python loops) | ~512 | 14–16 hours |
+| Fallback (solve_triangular) | ~24 (8 outer × ~3) | ~3–5 hours |
+| Fast path (chunk_kda) | ~3 | < 3 hours |
+
+**Notes:**
+- `scale=1.0` is passed to `chunk_kda` because Q and K are already L2-normalized by `_feature_map` before entering the KDA branch — no further scaling is needed.
+- `use_qk_l2norm_in_kernel=False` for the same reason.
+- `initial_state` is passed as `float32` zeros, as required by the `chunk_kda` API.
+- Padding is handled the same way as before: K and V are zeroed for padded positions before the kernel call.

@@ -263,9 +263,72 @@ ibash
 #   - Normalizer: explicit z denominator dropped; Q/K L2-norm provides implicit normalization
 # The old _linear_kda_cepe run (6xsq7wqv) OOM'd at step 0 with the token-loop implementation.
 
-# C/Q//A linear_kda_v2: ModernBERT 400M (frozen) + TinyLlama (frozen) -> adapters only
-export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_v2_frozen"
-export COMMAND="python -m apps.minimal_squad.cepe \
+# # C/Q//A linear_kda_v2: ModernBERT 400M (frozen) + TinyLlama (frozen) -> adapters only
+# export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_v2_frozen"
+# export COMMAND="python -m apps.minimal_squad.cepe \
+#     --wandb_run_name $RUN_NAME \
+#     --data_format C/Q//A \
+#     --model_type encdec \
+#     --model_name modernbert_400m \
+#     --decoder_model_name tinyllama_1b \
+#     --cross_attn_type linear_kda \
+#     --pretrained_weight_updating 0.0 \
+#     --epochs 5 \
+#     --batch_size 8"
+# submit "$RUN_NAME" "$COMMAND"
+
+# # C/Q//A linear_kda_v2 CEPE: ModernBERT 400M (trained 0.333x) + TinyLlama (frozen)
+# export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_v2_cepe"
+# export COMMAND="python -m apps.minimal_squad.cepe \
+#     --wandb_run_name $RUN_NAME \
+#     --data_format C/Q//A \
+#     --model_type encdec \
+#     --model_name modernbert_400m \
+#     --decoder_model_name tinyllama_1b \
+#     --cross_attn_type linear_kda \
+#     --pretrained_weight_updating 0.0 \
+#     --encoder_weight_updating 0.333 \
+#     --epochs 5 \
+#     --batch_size 8"
+# submit "$RUN_NAME" "$COMMAND"
+
+# # C/Q//A linear_kda_v2 CEPE: ModernBERT 150M (trained 0.333x) + TinyLlama (frozen)
+# export RUN_NAME="modernbert150m_tinyllama1b_cq_a_linear_kda_v2_cepe"
+# export COMMAND="python -m apps.minimal_squad.cepe \
+#     --wandb_run_name $RUN_NAME \
+#     --data_format C/Q//A \
+#     --model_type encdec \
+#     --model_name modernbert_150m \
+#     --decoder_model_name tinyllama_1b \
+#     --cross_attn_type linear_kda \
+#     --pretrained_weight_updating 0.0 \
+#     --encoder_weight_updating 0.333 \
+#     --epochs 5 \
+#     --batch_size 8"
+# submit "$RUN_NAME" "$COMMAND"
+
+# # C/Q//A linear_kda_v2: ModernBERT 400M (trained 0.333x) + TinyLlama (trained 0.333x) -> all trained
+# export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_v2_finetune"
+# export COMMAND="python -m apps.minimal_squad.cepe \
+#     --wandb_run_name $RUN_NAME \
+#     --data_format C/Q//A \
+#     --model_type encdec \
+#     --model_name modernbert_400m \
+#     --decoder_model_name tinyllama_1b \
+#     --cross_attn_type linear_kda \
+#     --pretrained_weight_updating 0.333 \
+#     --epochs 5 \
+#     --batch_size 8"
+# submit "$RUN_NAME" "$COMMAND"
+
+# --- Variant: linear_kda FLA fast path (chunk_kda Triton kernel) ---
+# Same architecture as linear_kda_v2 above but with _FLA_AVAILABLE forced True by
+# adding flash-linear-attention to PYTHONPATH. Uses the fused chunk_kda Triton kernel
+# instead of the Python fallback loop — expected ~3x faster than the fallback path.
+
+# C/Q//A linear_kda FLA frozen: ModernBERT 400M (frozen) + TinyLlama (frozen) -> adapters only
+export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_frozen"
+export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -277,9 +340,9 @@ export COMMAND="python -m apps.minimal_squad.cepe \
     --batch_size 8"
 submit "$RUN_NAME" "$COMMAND"
 
-# C/Q//A linear_kda_v2 CEPE: ModernBERT 400M (trained 0.333x) + TinyLlama (frozen)
-export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_v2_cepe"
-export COMMAND="python -m apps.minimal_squad.cepe \
+# C/Q//A linear_kda FLA CEPE: ModernBERT 400M (trained 0.333x) + TinyLlama (frozen)
+export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_cepe"
+export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -292,9 +355,9 @@ export COMMAND="python -m apps.minimal_squad.cepe \
     --batch_size 8"
 submit "$RUN_NAME" "$COMMAND"
 
-# C/Q//A linear_kda_v2 CEPE: ModernBERT 150M (trained 0.333x) + TinyLlama (frozen)
-export RUN_NAME="modernbert150m_tinyllama1b_cq_a_linear_kda_v2_cepe"
-export COMMAND="python -m apps.minimal_squad.cepe \
+# C/Q//A linear_kda FLA CEPE: ModernBERT 150M (trained 0.333x) + TinyLlama (frozen)
+export RUN_NAME="modernbert150m_tinyllama1b_cq_a_linear_kda_fla_cepe"
+export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
@@ -307,9 +370,9 @@ export COMMAND="python -m apps.minimal_squad.cepe \
     --batch_size 8"
 submit "$RUN_NAME" "$COMMAND"
 
-# C/Q//A linear_kda_v2: ModernBERT 400M (trained 0.333x) + TinyLlama (trained 0.333x) -> all trained
-export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_v2_finetune"
-export COMMAND="python -m apps.minimal_squad.cepe \
+# C/Q//A linear_kda FLA finetune: ModernBERT 400M (trained 0.333x) + TinyLlama (trained 0.333x)
+export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_finetune"
+export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
     --model_type encdec \
