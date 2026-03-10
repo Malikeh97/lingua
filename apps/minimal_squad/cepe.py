@@ -64,6 +64,7 @@ try:
     _FLA_AVAILABLE = True
 except ImportError:
     _FLA_AVAILABLE = False
+print(f"[cepe] FLA available: {_FLA_AVAILABLE}", flush=True)
 
 
 # ============== Data Preparation ==============

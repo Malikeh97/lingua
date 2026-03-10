@@ -327,7 +327,7 @@ ibash
 # instead of the Python fallback loop — expected ~3x faster than the fallback path.
 
 # C/Q//A linear_kda FLA frozen: ModernBERT 400M (frozen) + TinyLlama (frozen) -> adapters only
-export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_frozen"
+export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_v2_frozen"
 export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
@@ -341,7 +341,7 @@ export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPAT
 submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A linear_kda FLA CEPE: ModernBERT 400M (trained 0.333x) + TinyLlama (frozen)
-export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_cepe"
+export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_v2_cepe"
 export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
@@ -356,7 +356,7 @@ export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPAT
 submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A linear_kda FLA CEPE: ModernBERT 150M (trained 0.333x) + TinyLlama (frozen)
-export RUN_NAME="modernbert150m_tinyllama1b_cq_a_linear_kda_fla_cepe"
+export RUN_NAME="modernbert150m_tinyllama1b_cq_a_linear_kda_fla_v2_cepe"
 export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \
@@ -371,7 +371,7 @@ export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPAT
 submit "$RUN_NAME" "$COMMAND"
 
 # C/Q//A linear_kda FLA finetune: ModernBERT 400M (trained 0.333x) + TinyLlama (trained 0.333x)
-export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_finetune"
+export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_v2_finetune"
 export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
     --wandb_run_name $RUN_NAME \
     --data_format C/Q//A \

@@ -242,3 +242,34 @@ The `linear_kda` cross-attention variant was 4–5x slower than full softmax att
 - `use_qk_l2norm_in_kernel=False` for the same reason.
 - `initial_state` is passed as `float32` zeros, as required by the `chunk_kda` API.
 - Padding is handled the same way as before: K and V are zeroed for padded positions before the kernel call.
+
+### `einops` Missing Dependency Fix — March 10, 2026
+
+**Problem:** The `_FLA_AVAILABLE` flag was always `False` even when the `flash-linear-attention` library was bundled correctly. All `linear_kda_fla` experiments silently fell back to the PyTorch path, matching the `linear_kda_v2` speed (~0.67–0.82 it/s, ~4–5h/epoch).
+
+**Root cause:** `from fla.ops.kda import chunk_kda` triggers `fla/__init__.py`, which imports `fla.layers.abc`, which requires `einops`. Since `einops` was not in the project dependencies, a `ModuleNotFoundError` was raised and silently caught:
+
+```python
+try:
+    from fla.ops.kda import chunk_kda as _chunk_kda
+    _FLA_AVAILABLE = True
+except ImportError:          # ModuleNotFoundError is a subclass
+    _FLA_AVAILABLE = False   # ← always landed here
+```
+
+**Fix:** Added `einops` to `pyproject.toml` and `requirements.txt`. Also added a startup print to make FLA status visible in job logs:
+
+```python
+print(f"[cepe] FLA available: {_FLA_AVAILABLE}", flush=True)
+```
+
+**Confirmed speedup** (L40S GPU, ModernBERT-large 400M + TinyLlama 1B, batch size 8, March 10 runs):
+
+| Strategy | Fallback speed | FLA kernel speed | Speedup | Epoch time |
+|----------|---------------|-----------------|---------|------------|
+| Frozen (adapters only) | ~0.82 it/s | **~4.88 it/s** | **~6×** | ~37 min |
+| CEPE 400M encoder | ~0.71 it/s | **~3.70 it/s** | **~5.2×** | ~49 min |
+| CEPE 150M encoder | ~0.75 it/s | **~4.14 it/s** | **~5.5×** | ~44 min |
+| Finetune (full model) | ~0.67 it/s | **~1.17 it/s** | **~1.75×** | ~2.6h |
+
+The CEPE variants are now **faster than the softmax baseline** (~2.07 it/s, ~1.5h/epoch). The finetune speedup is smaller because the full encoder + decoder backward pass dominates over the adapter computation.

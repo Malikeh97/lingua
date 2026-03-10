@@ -27,6 +27,7 @@ dependencies = [
     "huggingface_hub",
     "ninja",
     "pip",
+    "einops",
 ]
 
 [build-system]

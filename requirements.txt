@@ -13,3 +13,4 @@ scipy
 pynvml
 datatrove
 orjson
+einops
