@@ -143,12 +143,12 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 
 | Epoch | Softmax (baseline) | Kimi KDA v2 (no FLA, partial) | Kimi KDA FLA v2 ✅ |
 |-------|-------------------|-----------------------------|-------------------|
-| 1 | 68.6 | **79.4** | 78.8 |
-| 2 | 73.6 | **80.8** | 79.2 |
-| 3 | **78.4** | **≥81.4** (ep3@90%) | 80.0 |
-| 4 | — | — | 78.6 |
-| 5 | — | — | **81.4** |
-| **Best** | **78.4** (ep3) | **≥81.4** (partial) | **81.4** (ep5) |
+| 1 | 68.6 | 78.60%  | 78.8 |
+| 2 | 73.6 | **81.40%** | 79.2 |
+| 3 | **78.4** | 80.00 | 80.0 |
+| 4 | 71.4 |  81.40 (ep4@60%) | 78.6 |
+| 5 | 76.6 | — | **81.4** |
+| **Best** | **78.4** (ep3) | **81.4** (partial) | **81.4** (ep5) |
 
 ### Val Loss — 400M Finetune, Kimi KDA FLA v2
 
@@ -173,11 +173,11 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 | Strategy | Softmax | Kimi KDA v2 (no FLA, partial) | Kimi KDA FLA v2 ✅ | vs Softmax |
 |----------|---------|-------------------------------|-------------------|------------|
 | Frozen | 43.4 | 14.8 (ep3) | **21.4** (ep3) | −22.0 |
-| CEPE | 77.6 | **≥83.2** (ep3 partial) | **78.2** (ep2) | +0.6 |
-| Finetune | 78.4 | **≥81.4** (ep3 partial) | **81.4** (ep5) | +3.0 |
+| CEPE | 77.6 | **80.80** (ep3) | **78.2** (ep2) | +0.6 |
+| Finetune | 78.4 | **81.4** (ep2) | **81.4** (ep5) | +3.0 |
 
 **Key takeaways**:
-- **CEPE**: FLA v2 achieves parity with softmax (+0.6 pp), while non-FLA v2 was tracking toward a larger gain (≥83.2%) — FLA kernel introduces different optimization dynamics
+- **CEPE**: FLA v2 achieves parity with softmax (+0.6 pp), while non-FLA v2 was tracking toward a larger gain 80.80 — FLA kernel introduces different optimization dynamics
 - **Finetune**: FLA v2 definitively surpasses softmax by +3 points with a complete 5-epoch run
 - **Frozen**: Linear attention remains far below softmax in frozen mode; FLA v2 improves over non-FLA v2 (21.4% vs 14.8%) but the gap with softmax (43.4%) is large
 
@@ -187,7 +187,7 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 
 | Strategy | Softmax | Kimi KDA v2 (no FLA, partial) | Kimi KDA FLA v2 ✅ | vs Softmax |
 |----------|---------|-------------------------------|-------------------|------------|
-| CEPE | 55.6 | 65.8 (ep2) | **66.6** (ep4) | +11.0 |
+| CEPE | 55.6 | 64.40 (ep3) | **66.6** (ep4) | +11.0 |
 
 ---
 
