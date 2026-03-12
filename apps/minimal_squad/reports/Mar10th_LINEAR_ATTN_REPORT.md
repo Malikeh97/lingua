@@ -112,12 +112,12 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 
 | Epoch | Softmax (baseline) | Kimi KDA v2 (no FLA, partial) | Kimi KDA FLA v2 ✅ |
 |-------|-------------------|-----------------------------|-------------------|
-| 1 | 42.8 | **56.8** | 60.8 |
-| 2 | 51.2 | **65.8** | 66.2 |
-| 3 | 55.4 | 64.2 (overfit) | 64.8 |
-| 4 | 53.2 | — | **66.6** |
+| 1 | 42.8 | 54.80 | 60.8 |
+| 2 | 51.2 | 61.00 | 66.2 |
+| 3 | 55.4 | **64.40** | 64.8 |
+| 4 | 53.2 |64.20 (90%) | **66.6** |
 | 5 | **55.6** | — | 63.6 |
-| **Best** | **55.6** | **65.8** (ep2) | **66.6** (ep4) |
+| **Best** | **55.6** | **64.40** (ep3) | **66.6** (ep4) |
 
 ### Val Loss — 150M CEPE, Kimi KDA FLA v2
 
@@ -131,8 +131,8 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 
 **Findings**:
 - Kimi KDA FLA v2 150M achieves **66.6% EM** (ep4) — a **+11 point gain** over the softmax 150M baseline (55.6%)
-- FLA v2 slightly exceeds Kimi KDA v2 (no FLA) best: 66.6% vs 65.8%, though both run on the same code path differences are minor
-- Both Kimi KDA variants peak at epoch 2 or 4 then overfit (consistent val loss increase after peak)
+- FLA v2 slightly exceeds Kimi KDA v2 (no FLA) best: 66.6% vs 64.40%, though both run on the same code path differences are minor
+- Both Kimi KDA variants peak at epoch 3 or 4 then overfit (consistent val loss increase after peak)
 - The 150M encoder gap vs 400M encoder is large: 66.6% vs 78.2% for CEPE with FLA v2
 
 ---
