@@ -81,12 +81,12 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 
 | Epoch | Softmax (baseline) | Kimi KDA v2 (no FLA, partial) | Kimi KDA FLA v2 ✅ |
 |-------|-------------------|-----------------------------|-------------------|
-| 1 | 61.4 | **78.0** | 73.4 |
-| 2 | 70.4 | **80.2** | **78.2** |
-| 3 | **77.6** | **≥83.2** (ep3@60%) | 77.8 |
-| 4 | — | — | 78.0 |
-| 5 | — | — | 77.4 |
-| **Best** | **77.6** (ep3) | **≥83.2** (ep3 partial) | **78.2** (ep2) |
+| 1 | 61.4 | 76.80 | 73.4 |
+| 2 | 70.4 | 80.60 | **78.2** |
+| 3 | **77.6** | **80.80%** | 77.8 |
+| 4 | 74.8 | 79.60% (ep4@80%) | 78.0 |
+| 5 | 76.4 | — | 77.4 |
+| **Best** | **77.6** (ep3) | **80.80** (ep3 partial) | **78.2** (ep2) |
 
 ### Val Loss — 400M CEPE, Kimi KDA FLA v2
 
@@ -101,7 +101,7 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 **Findings**:
 - FLA v2 CEPE 400M peaks at **78.2% EM** (ep2), narrowly surpassing the softmax 5-epoch best of 77.6% (+0.6 pp)
 - The model plateaus at ~77–78% across epochs 2–5 with increasing val loss, indicating overfitting beyond epoch 2
-- Kimi KDA v2 (no FLA, partial) was tracking higher (≥83.2% at ep3), suggesting the FLA kernel's chunkwise computation produces a slightly different optimization trajectory than the reference PyTorch implementation
+- Kimi KDA v2 (no FLA, partial) was tracking higher (80.80% at ep3), suggesting the FLA kernel's chunkwise computation produces a slightly different optimization trajectory than the reference PyTorch implementation
 - Both variants substantially outpace softmax in early epochs (ep1: 73.4% FLA vs 61.4% softmax) — convergence speed advantage is maintained
 
 ---
