@@ -193,26 +193,47 @@ Only Kimi KDA frozen experiments were run (no softmax frozen equivalent in this 
 
 ## Training Speed and Efficiency
 
-All experiments run on **L40S GPU (44GB VRAM)**, batch size 8, ModernBERT encoder + TinyLlama 1B decoder. FLA v2 run times from SLURM `sacct` (5 epochs each).
+All experiments run on **L40S GPU (44GB VRAM)**, batch size 8, ModernBERT encoder + TinyLlama 1B decoder, **C/Q//A mode**. Timings measured from tqdm epoch completion lines in SLURM logs; FLA v2 totals cross-checked with `sacct`.
 
-| Variant | Total (5 ep) | Time/epoch | vs. Softmax |
-|---------|-------------|------------|-------------|
-| Softmax baseline (FlashAttention) | ~7.5h | ~1.5h | 1× (reference) |
-| Kimi KDA v2 (no FLA, PyTorch fallback) | ~20–22h | ~4.0–4.5h | ~0.33× |
-| **Kimi KDA FLA v2 — Frozen (2361403)** | **5h 14m** | **~1.05h** | **~1.43×** |
-| **Kimi KDA FLA v2 — CEPE 400M (2361404)** | **6h 06m** | **~1.22h** | **~1.23×** |
-| **Kimi KDA FLA v2 — CEPE 150M (2361405)** | **5h 40m** | **~1.13h** | **~1.33×** |
-| **Kimi KDA FLA v2 — Finetune 400M (2361406)** | **19h 31m** | **~3.91h** | **~0.38×** |
+### Per-Epoch Wall Time — Apple-to-Apple (C/Q//A mode)
 
-> FLA v2 SLURM elapsed from `sacct -j 2361403,2361404,2361405,2361406`.
+| Strategy | Encoder | Softmax | No-FLA KDA v2 | FLA v2 | FLA vs Softmax | FLA vs No-FLA |
+|----------|---------|---------|---------------|--------|----------------|---------------|
+| Frozen | 400M | **~25 min** | ~5.6h | ~1.03h | 0.40× (2.5× slower) | **5.4× faster** |
+| CEPE | 400M | ~1.52h | ~6.0h | ~1.18h | **1.29× faster** | **5.1× faster** |
+| CEPE | 150M | ~1.34h | ~5.75h | ~1.09h | **1.23× faster** | **5.3× faster** |
+| Finetune | 400M | ~1.84h | ~6.25h | ~3.77h | 0.49× (2.0× slower) | **1.7× faster** |
 
-### FLA Kernel Confirmation
+### Total Run Time (5 epochs)
 
-The new `fla_v2` runs confirm the `chunk_kda` Triton kernel is **active**:
-- Frozen/CEPE runs: **~1.05–1.22h/epoch** (vs ~4h with PyTorch fallback) — **3–4× speedup** consistent with FLA's O(T/chunk × d²) chunkwise complexity
-- Finetune: **~3.9h/epoch** — the FLA kernel accelerates the forward pass, but backpropagation through all 1.9B parameters (encoder + decoder + KDA adapter) dominates the wall time, limiting the speedup to ~1.2× vs no-FLA finetune
+| Variant | Strategy | Encoder | Total (5 ep) | Avg/epoch |
+|---------|----------|---------|-------------|-----------|
+| Softmax | Frozen | 400M | ~2.1h | ~25 min |
+| Softmax | CEPE | 400M | ~7.6h | ~1.52h |
+| Softmax | CEPE | 150M | ~6.7h | ~1.34h |
+| Softmax | Finetune | 400M | ~9.2h | ~1.84h |
+| No-FLA KDA v2 | Frozen | 400M | ~28h (est, 3 ep ran) | ~5.6h |
+| No-FLA KDA v2 | CEPE | 400M | ~30.3h (5 ep) | ~6.0h |
+| No-FLA KDA v2 | CEPE | 150M | ~29h (est, 3 ep ran) | ~5.75h |
+| No-FLA KDA v2 | Finetune | 400M | ~31h (est, 3 ep ran) | ~6.25h |
+| **FLA v2 (2361403)** | **Frozen** | **400M** | **5h 14m** | **~1.03h** |
+| **FLA v2 (2361404)** | **CEPE** | **400M** | **6h 06m** | **~1.18h** |
+| **FLA v2 (2361405)** | **CEPE** | **150M** | **5h 40m** | **~1.09h** |
+| **FLA v2 (2361406)** | **Finetune** | **400M** | **19h 31m** | **~3.77h** |
 
-GPU memory was not explicitly logged (no `torch.cuda.max_memory_allocated()` instrumentation). All runs completed successfully on L40S (44GB VRAM), suggesting peak usage is comfortably within budget. CPU RAM from `sacct MaxRSS`: 2.8–3.6 GB across the three non-finetune runs (finetune MaxRSS unreliable due to multi-process logging).
+> FLA v2 totals from `sacct -j 2361403,2361404,2361405,2361406`. Softmax and no-FLA timings measured from tqdm progress bars in SLURM `.out` logs.
+
+### Analysis
+
+**Frozen encoder**: Softmax frozen is the fastest at ~25 min/epoch because it only backpropagates through the 371M adapter parameters — the encoder is frozen. FLA v2 frozen (~1.03h/epoch) is ~2.5× slower than softmax frozen but ~5.4× faster than the no-FLA PyTorch fallback (~5.6h/epoch). The FLA Triton kernel alone does not overcome the additional KDA adapter compute (g_proj, beta_proj) vs a lightweight cross-attention head.
+
+**CEPE**: FLA v2 CEPE is modestly **faster than softmax** (+1.23–1.29×) because once the full encoder is being trained, the FLA kernel's O(T/chunk × d²) chunkwise complexity gains over FlashAttention's O(T²/block) for long-sequence cross-attention. No-FLA is ~4–5× slower than softmax in CEPE.
+
+**Finetune**: FLA v2 finetune (~3.77h/epoch) is ~2× slower than softmax finetune (~1.84h/epoch). Backpropagation through all 1.96B parameters (encoder + decoder + KDA adapter) dominates wall time; the FLA kernel accelerates forward-pass cross-attention but cannot offset the extra adapter parameters in the backward pass.
+
+**FLA vs no-FLA**: Across all strategies, the FLA `chunk_kda` Triton kernel provides a **5× speedup** for frozen/CEPE and a **1.7× speedup** for finetune compared to the PyTorch reference implementation.
+
+GPU memory was not explicitly logged. All runs completed on L40S (44GB VRAM). CPU RAM from `sacct MaxRSS`: 2.8–3.6 GB for non-finetune runs.
 
 ---
 
@@ -224,9 +245,10 @@ GPU memory was not explicitly logged (no `torch.cuda.max_memory_allocated()` ins
 | CEPE 150M best EM | **65.8%** (ep2) | **66.6%** (ep4) | +0.8 pp |
 | Finetune best EM | **≥81.4%** (ep3 partial) | **81.4%** (ep5, complete) | ~0 |
 | Frozen best EM | 14.8% (ep3) | **21.4%** (ep3) | +6.6 pp |
-| Time/epoch (frozen) | ~3.7h | **~1.05h** | **3.5× faster** |
-| Time/epoch (CEPE) | ~4.2h | **~1.22h** | **3.4× faster** |
-| Time/epoch (finetune) | ~4.5h | ~3.91h | 1.15× faster |
+| Time/epoch (frozen) | ~5.6h | **~1.03h** | **5.4× faster** |
+| Time/epoch (CEPE 400M) | ~6.0h | **~1.18h** | **5.1× faster** |
+| Time/epoch (CEPE 150M) | ~5.75h | **~1.09h** | **5.3× faster** |
+| Time/epoch (finetune) | ~6.25h | ~3.77h | **1.7× faster** |
 
 **Summary**: FLA v2 is dramatically faster for frozen/CEPE (3–4×), roughly matches no-FLA quality for finetune and 150M CEPE, and shows mixed results for 400M CEPE — the non-FLA v2 partial results suggested a higher ceiling (≥83.2%) that FLA v2 did not reach. This discrepancy likely reflects both numerical differences in the chunkwise Triton kernel vs serial reference and the fact that the non-FLA v2 run was incomplete.
 
