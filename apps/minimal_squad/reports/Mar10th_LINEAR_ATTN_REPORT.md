@@ -237,23 +237,6 @@ GPU memory was not explicitly logged. All runs completed on L40S (44GB VRAM). CP
 
 ---
 
-## Kimi KDA FLA v2 vs Kimi KDA v2 (no FLA): Direct Comparison
-
-| Metric | Kimi KDA v2 (partial) | Kimi KDA FLA v2 (complete) | Delta |
-|--------|----------------------|---------------------------|-------|
-| CEPE 400M best EM | **≥83.2%** (ep3@60%, incomplete) | 78.2% (ep2, complete) | −5 pp |
-| CEPE 150M best EM | **65.8%** (ep2) | **66.6%** (ep4) | +0.8 pp |
-| Finetune best EM | **≥81.4%** (ep3 partial) | **81.4%** (ep5, complete) | ~0 |
-| Frozen best EM | 14.8% (ep3) | **21.4%** (ep3) | +6.6 pp |
-| Time/epoch (frozen) | ~5.6h | **~1.03h** | **5.4× faster** |
-| Time/epoch (CEPE 400M) | ~6.0h | **~1.18h** | **5.1× faster** |
-| Time/epoch (CEPE 150M) | ~5.75h | **~1.09h** | **5.3× faster** |
-| Time/epoch (finetune) | ~6.25h | ~3.77h | **1.7× faster** |
-
-**Summary**: FLA v2 is dramatically faster for frozen/CEPE (3–4×), roughly matches no-FLA quality for finetune and 150M CEPE, and shows mixed results for 400M CEPE — the non-FLA v2 partial results suggested a higher ceiling (≥83.2%) that FLA v2 did not reach. This discrepancy likely reflects both numerical differences in the chunkwise Triton kernel vs serial reference and the fact that the non-FLA v2 run was incomplete.
-
----
-
 ## Key Observations
 
 1. **Kimi KDA FLA v2 finetune definitively surpasses softmax**: 81.4% vs 78.4% (+3 pp) in a complete 5-epoch run on 400M encoder. This is the clearest signal that the KDA delta-rule mechanism adds quality over softmax for full fine-tuning.
@@ -275,54 +258,8 @@ GPU memory was not explicitly logged. All runs completed on L40S (44GB VRAM). CP
 
 ---
 
-## Training Curves at a Glance
-
-### 400M Encoder, CEPE — EM% per epoch
-
-```
-90 |        ≥83.2 (v2 no-FLA, partial, ep3@60%)
-   |  ···················
-80 |     78.0(v2)  78.2(FLA ep2)  78.0  77.4
-   |        73.4
-   |  61.4  70.4  77.6 [softmax peak]
-70 |
-   +----------------------------------------------------------
-     ep1   ep2   ep3   ep4   ep5
-
-     — softmax    ··· Kimi KDA v2 (partial)    --- Kimi KDA FLA v2
-```
-
-### 400M Encoder, Finetune — EM% per epoch
-
-```
-85 |                               81.4 (FLA v2 ep5)
-   |  78.8  79.2  80.0        ---·
-80 |     80.8(v2 partial)  78.6
-   |  79.4  73.6  78.4 [softmax peak]
-75 |  68.6
-   +----------------------------------------------------------
-     ep1   ep2   ep3   ep4   ep5
-```
-
-### 150M Encoder, CEPE — EM% per epoch
-
-```
-70 |        65.8(v2)  66.6(FLA ep4)
-   |  60.8  66.2  64.8       63.6
-   |   42.8  51.2  55.4  53.2  55.6 [softmax peak]
-50 |
-   +----------------------------------------------------------
-     ep1   ep2   ep3   ep4   ep5
-```
-
----
-
 ## Next Steps
 
-1. **Run Kimi KDA v2 (no FLA) to completion**: The partial ep3 data showed ≥83.2% CEPE 400M — completing all 5 epochs would clarify whether FLA kernel numerics genuinely limit quality or whether the gap closes with longer training.
+1. **Investigate finetune speedup gap**: FLA kernel provides 3–4× speedup for frozen/CEPE but only ~1.2× for finetune. Profiling where finetune time is spent (backward through encoder vs decoder vs KDA adapter) would identify optimization targets.
 
-2. **Investigate finetune speedup gap**: FLA kernel provides 3–4× speedup for frozen/CEPE but only ~1.2× for finetune. Profiling where finetune time is spent (backward through encoder vs decoder vs KDA adapter) would identify optimization targets.
-
-3. **GPU memory profiling**: Add `torch.cuda.max_memory_allocated()` logging to confirm VRAM headroom on L40S and assess scalability to longer sequences or larger batch sizes.
-
-4. **Diagnose CEPE 400M quality gap**: FLA v2 (78.2%) vs non-FLA v2 partial (≥83.2%) — investigate whether this reflects kernel numerics (chunked delta-rule vs serial), learning rate sensitivity, or simply the non-FLA run having a better random seed.
+2. **GPU memory profiling**: Add `torch.cuda.max_memory_allocated()` logging to confirm VRAM headroom on L40S and assess scalability to longer sequences or larger batch sizes.
