@@ -933,6 +933,9 @@ class LinearCrossAttentionAdapter(nn.Module):
                     initial_state=h0,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=False,
+                    disable_recompute=True,   # save intermediates → faster backward
+                    safe_gate=True,           # enable M=16 TensorCore path
+                    lower_bound=-5.0,         # logsigmoid gates are always < 0, -5 is safe
                 )
                 # final_state: [B, H, d_k, d_k] (float32) — cast to match Q dtype
                 S = final_state.to(Q.dtype)
@@ -2618,7 +2621,7 @@ def main():
         )
 
     optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters, lr=args.lr, weight_decay=0.01
+        optimizer_grouped_parameters, lr=args.lr, weight_decay=0.01, fused=True
     )
 
     def run_squad_eval(epoch, step, total_steps):
