@@ -306,3 +306,35 @@ optimizer = torch.optim.AdamW(..., fused=True)
 ```
 
 **Note:** These changes only affect the finetune training speed — correctness and EM% are unaffected. CEPE/frozen runs are already bottlenecked by the adapter forward rather than backward, so the gain there will be smaller.
+
+### Linear Attention in From-Scratch Decoder (`cepe.py`) — March 2026
+
+**Motivation:** The `--cross_attn_type` flag previously only worked with a pretrained decoder (`--decoder_model_name`). The from-scratch `DecoderLayer` hardcoded `nn.MultiheadAttention` for cross-attention with no way to swap in KDA. This change enables a direct softmax vs linear_kda comparison using a decoder trained from scratch (6-layer and 12-layer), matching the architecture in `main.py`.
+
+**What changed:**
+
+`DecoderLayer` now accepts `cross_attn_type: str = "softmax"`. The hardcoded `self.cross_attn + self.cross_attn_norm` pair is replaced by a single `self.cross_attn_module` using the existing adapter classes:
+
+```
+cross_attn_type="softmax"    → CrossAttentionAdapter
+cross_attn_type="linear_kda" → LinearCrossAttentionAdapter(variant="linear_kda")
+```
+
+Both adapters share the same `forward(x, encoder_output, mask, return_attn)` API and handle LayerNorm + residual internally, so `DecoderLayer.forward` is uniform regardless of attention type. `out_proj` is zero-initialized in both cases — cross-attention starts as a no-op and the model gradually learns to use encoder context.
+
+`_init_decoder` and `UnifiedModel.__init__` were updated to thread `cross_attn_type` through to each `DecoderLayer`.
+
+**New experiments in `cepe_exps.sh`:**
+
+| Run name | Decoder | Layers | Attention |
+|---|---|---|---|
+| `modernbert400m_scratch6l_cq_a_softmax` | from-scratch | 6 | softmax |
+| `modernbert400m_scratch6l_cq_a_linear_kda` | from-scratch | 6 | KDA (FLA) |
+| `modernbert400m_scratch12l_cq_a_softmax` | from-scratch | 12 | softmax |
+| `modernbert400m_scratch12l_cq_a_linear_kda` | from-scratch | 12 | KDA (FLA) |
+| `modernbert400m_scratch22l_cq_a_softmax` | from-scratch | 22 | softmax |
+| `modernbert400m_scratch22l_cq_a_linear_kda` | from-scratch | 22 | KDA (FLA) |
+
+All use `modernbert_400m` encoder with `--pretrained_weight_updating 0.333`, 5 epochs, batch 8. The KDA variants include `PYTHONPATH=...flash-linear-attention:...` for the FLA kernel.
+
+The 22L experiments match TinyLlama's depth (22 decoder layers). At this depth, self-attn + FFN dilute the KDA cross-attention cost, so the expected slowdown shrinks from ~3× (6L/12L) to ~1.5×. This is the most meaningful comparison point for the from-scratch vs pretrained-decoder tradeoff.

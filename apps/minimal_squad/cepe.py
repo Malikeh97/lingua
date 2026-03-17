@@ -653,17 +653,30 @@ def infer_special_tokens(tokenizer):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        cross_attn_type: str = "softmax",
+    ):
         super().__init__()
         self.num_heads = num_heads
+        self.cross_attn_type = cross_attn_type
         self.self_attn = nn.MultiheadAttention(
             hidden_size, num_heads, dropout=dropout, batch_first=True
         )
         self.self_attn_norm = nn.LayerNorm(hidden_size)
-        self.cross_attn = nn.MultiheadAttention(
-            hidden_size, num_heads, dropout=dropout, batch_first=True
-        )
-        self.cross_attn_norm = nn.LayerNorm(hidden_size)
+        # Unified adapter interface: both variants handle LayerNorm + residual internally
+        # and share the same forward(x, encoder_output, mask, return_attn) API.
+        # out_proj is zero-initialized so cross-attention starts as a no-op, letting
+        # the model first learn from self-attention then gradually use encoder context.
+        if cross_attn_type == "softmax":
+            self.cross_attn_module = CrossAttentionAdapter(hidden_size, num_heads, dropout)
+        else:
+            self.cross_attn_module = LinearCrossAttentionAdapter(
+                hidden_size, num_heads, dropout, variant=cross_attn_type
+            )
         self.ffn = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 4),
             nn.GELU(),
@@ -686,19 +699,14 @@ class DecoderLayer(nn.Module):
         x, _ = self.self_attn(x, x, x, attn_mask=causal_mask, is_causal=True)
         x = residual + x
 
-        residual = x
-        x = self.cross_attn_norm(x)
-        x, cross_attn_weights = self.cross_attn(
-            x,
-            encoder_output,
-            encoder_output,
-            key_padding_mask=(
-                ~encoder_padding_mask if encoder_padding_mask is not None else None
-            ),
-            need_weights=return_attn,
-            average_attn_weights=False,  # Return per-head weights: (batch, num_heads, tgt_len, src_len)
-        )
-        x = residual + x
+        # Cross-attention: adapter handles LayerNorm + residual internally
+        if return_attn:
+            x, cross_attn_weights = self.cross_attn_module(
+                x, encoder_output, encoder_padding_mask, return_attn=True
+            )
+        else:
+            x = self.cross_attn_module(x, encoder_output, encoder_padding_mask)
+            cross_attn_weights = None
 
         residual = x
         x = self.ffn_norm(x)
@@ -716,20 +724,23 @@ class DecoderLayer(nn.Module):
         def tn(w, std):
             nn.init.trunc_normal_(w, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
-        # Attention Q/K/V and output projections
-        for attn in [self.self_attn, self.cross_attn]:
-            if attn.in_proj_weight is not None:
-                tn(attn.in_proj_weight, init_std)
-            tn(attn.out_proj.weight, out_std)
+        # Self-attention Q/K/V and output projection
+        if self.self_attn.in_proj_weight is not None:
+            tn(self.self_attn.in_proj_weight, init_std)
+        tn(self.self_attn.out_proj.weight, out_std)
+
+        # Cross-attention adapter (handles its own init; out_proj stays zero)
+        self.cross_attn_module.init_weights(init_std, factor)
 
         # FFN
         tn(self.ffn[0].weight, init_std)
         tn(self.ffn[3].weight, ffn_out_std)
 
-        # LayerNorms to ones
-        for norm in [self.self_attn_norm, self.cross_attn_norm, self.ffn_norm]:
-            nn.init.ones_(norm.weight)
-            nn.init.zeros_(norm.bias)
+        # LayerNorms
+        nn.init.ones_(self.self_attn_norm.weight)
+        nn.init.zeros_(self.self_attn_norm.bias)
+        nn.init.ones_(self.ffn_norm.weight)
+        nn.init.zeros_(self.ffn_norm.bias)
 
 
 class CrossAttentionAdapter(nn.Module):
@@ -915,6 +926,10 @@ class LinearCrossAttentionAdapter(nn.Module):
                 K_enc = K.permute(0, 2, 1, 3).contiguous()       # [B, T_enc, H, d_k]
                 V_enc = V.permute(0, 2, 1, 3).contiguous()       # [B, T_enc, H, d_k]
                 g_enc = g_log.permute(0, 2, 1, 3).contiguous()   # [B, T_enc, H, d_k]
+                # Clamp gates to kernel's expected range [-5, 0).
+                # logsigmoid is always < 0; during from-scratch training large negative
+                # weights can push values << -5, causing NaN with safe_gate=True.
+                g_enc = g_enc.clamp(min=-5.0)
                 b_enc = beta_val.permute(0, 2, 1).contiguous()   # [B, T_enc, H]
 
                 # chunk_kda requires float32 initial state
@@ -1179,7 +1194,7 @@ class UnifiedModel(nn.Module):
                     decoder_model_name, cross_attn_num_heads, dropout, cross_attn_type
                 )
             else:
-                self._init_decoder(num_decoder_layers, num_heads, dropout, max_seq_len)
+                self._init_decoder(num_decoder_layers, num_heads, dropout, max_seq_len, cross_attn_type)
 
         # Resize embeddings if vocab_size differs (e.g., [SPAN] token added)
         if vocab_size is not None and vocab_size != self.vocab_size:
@@ -1211,7 +1226,7 @@ class UnifiedModel(nn.Module):
                     p.is_pretrained = True
                     p.is_pretrained_decoder = True
 
-    def _init_decoder(self, num_decoder_layers, num_heads, dropout, max_seq_len):
+    def _init_decoder(self, num_decoder_layers, num_heads, dropout, max_seq_len, cross_attn_type="softmax"):
         """Initialize decoder components for enc-dec generation."""
         self.decoder_embed = nn.Embedding(self.vocab_size, self.hidden_size)
         with torch.no_grad():
@@ -1223,7 +1238,7 @@ class UnifiedModel(nn.Module):
         self.pos_embed = nn.Embedding(max_seq_len, self.hidden_size)
         self.decoder_layers = nn.ModuleList(
             [
-                DecoderLayer(self.hidden_size, num_heads, dropout)
+                DecoderLayer(self.hidden_size, num_heads, dropout, cross_attn_type=cross_attn_type)
                 for _ in range(num_decoder_layers)
             ]
         )
