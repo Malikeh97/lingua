@@ -338,3 +338,83 @@ Both adapters share the same `forward(x, encoder_output, mask, return_attn)` API
 All use `modernbert_400m` encoder with `--pretrained_weight_updating 0.333`, 5 epochs, batch 8. The KDA variants include `PYTHONPATH=...flash-linear-attention:...` for the FLA kernel.
 
 The 22L experiments match TinyLlama's depth (22 decoder layers). At this depth, self-attn + FFN dilute the KDA cross-attention cost, so the expected slowdown shrinks from ~3× (6L/12L) to ~1.5×. This is the most meaningful comparison point for the from-scratch vs pretrained-decoder tradeoff.
+
+### KDA Bug Fixes + Llama-Style From-Scratch Decoder (`cepe.py`) — March 2026
+
+**Motivation:** From-scratch `linear_kda` runs were unstable (NaN/loss spikes) and significantly underperformed the softmax baseline. Two root causes were identified by comparing against FLA's `fla/ops/kda` reference implementation (`naive_chunk_kda`). Separately, the custom `DecoderLayer` used `nn.MultiheadAttention` (no RoPE) + `LayerNorm` + GELU FFN, mismatching Llama's architecture and degrading from-scratch training quality.
+
+#### Part A: KDA Bug Fixes in `LinearCrossAttentionAdapter`
+
+Four bugs fixed in the fallback chunked-recurrence path:
+
+**Bug 1 (Critical): Triangle mask `diagonal=0` → `diagonal=1`**
+
+The intra-chunk interaction matrix `A` was zeroing the diagonal along with the strict upper triangle. FLA's reference only masks the strict upper triangle (keeps diagonal, which represents each token's self-interaction):
+
+```python
+# Before (wrong): diagonal=0 — zeros diagonal too
+upper = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=K.device), diagonal=0)
+# After (correct): diagonal=1 — strict upper triangle only
+upper = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=K.device), diagonal=1)
+```
+
+**Bug 2 (Critical): Missing `(A + I)` after triangular solve**
+
+After `linalg.solve_triangular`, FLA's reference computes `(I + solve_triangular(...)) * beta`. The missing identity term means each token was not reading its own V contribution:
+
+```python
+# Before: A = solve_triangular(...) * beta
+# After: A = (I + solve_triangular(...)) * beta
+A = (
+    eye_BT[None, None].to(K.dtype) +
+    torch.linalg.solve_triangular(_eye[None, None] - _A, _eye[None, None].expand(B, H, -1, -1), upper=False).to(K.dtype)
+) * b_c.unsqueeze(-1)
+```
+
+**Bug 3 (Medium): Missing normalization for `linear_kda` final readout**
+
+The `linear` variant normalizes `O` by the partition function `Q @ z`. The `linear_kda` path had no normalization, allowing unbounded output magnitudes:
+
+```python
+# Before: O = torch.matmul(Q, S)
+# After: L2-normalize rows (Q/K are already L2-normed by _feature_map)
+O = F.normalize(torch.matmul(Q, S), p=2, dim=-1)
+```
+
+**Bug 4 (Medium): `beta_proj` not zero-initialized**
+
+`g_proj` was zero-initialized in `__init__` but `beta_proj` used PyTorch's default random init. Added zero-init for both weight and bias to ensure consistent behavior at initialization:
+
+```python
+nn.init.zeros_(self.beta_proj.weight)
+nn.init.zeros_(self.beta_proj.bias)
+```
+
+#### Part B: Llama-Style From-Scratch Decoder
+
+The custom `DecoderLayer` (6 components: `nn.MultiheadAttention`, `LayerNorm` × 2, GELU FFN) was replaced by `LlamaDecoderLayer` using Lingua's native components:
+
+| Component | Before | After |
+|-----------|--------|-------|
+| Self-attention | `nn.MultiheadAttention` (no RoPE) | Lingua `Attention` (RoPE via `freq_cis`) |
+| Normalization | `nn.LayerNorm` (post-norm style) | `RMSNorm` (pre-norm, Llama style) |
+| FFN | 4× GELU, 2 weights | SwiGLU ~2.67× (3 weights: w1, w2, w3) |
+| Positional encoding | Learned `pos_embed` (absolute) | RoPE buffer `freq_cis` (relative, no params) |
+| Output norm | `nn.LayerNorm` | `RMSNorm` |
+
+**`LlamaDecoderLayer`** is imported from the same `lingua.transformer` module used by the main Lingua training stack (`RMSNorm`, `Attention`, `FeedForward`, `precompute_freqs_cis`). The cross-attention adapter injection point is identical to the old `DecoderLayer` — adapters handle their own `LayerNorm` + residual.
+
+**Changes to `_init_decoder`:**
+- `pos_embed` (learnable embedding) replaced by `freq_cis` buffer (`precompute_freqs_cis(head_dim, max_seq_len)`, `persistent=False`)
+- `DecoderLayer` → `LlamaDecoderLayer`
+- `nn.LayerNorm` output norm → `RMSNorm`
+
+**Changes to `_run_custom_decoder`:**
+- Removed manual `torch.triu(...)` causal mask construction (handled inside Lingua `Attention` via `mask="causal"`)
+- Removed `+ self.pos_embed(positions)` — RoPE is applied inside `Attention`
+- `freq_cis` sliced and passed to each layer
+
+**Changes to `init_weights`:**
+- `output_norm` init no longer sets `.bias` (RMSNorm has no bias)
+- `pos_embed` removed from embedding init loop
+- `LlamaDecoderLayer.init_weights` uses `wq/wk/wv/wo` naming (Lingua convention) instead of `in_proj_weight/out_proj`

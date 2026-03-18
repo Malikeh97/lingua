@@ -56,6 +56,13 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 import os as _os, sys as _sys
+
+# Lingua transformer components for LlamaDecoderLayer
+_lingua_root = _os.path.join(_os.path.dirname(__file__), "..", "..")
+if _lingua_root not in _sys.path:
+    _sys.path.insert(0, _lingua_root)
+from lingua.transformer import RMSNorm, Attention, FeedForward, precompute_freqs_cis
+
 _fla_path = _os.path.join(_os.path.dirname(__file__), "flash-linear-attention")
 if _fla_path not in _sys.path:
     _sys.path.insert(0, _fla_path)
@@ -743,6 +750,102 @@ class DecoderLayer(nn.Module):
         nn.init.zeros_(self.ffn_norm.bias)
 
 
+class LlamaDecoderLayer(nn.Module):
+    """Llama-style decoder layer using Lingua's RMSNorm, Attention (RoPE), and SwiGLU FFN.
+
+    Replaces the custom DecoderLayer (nn.MultiheadAttention + LayerNorm + GELU FFN) with
+    components that match the pretrained Llama architecture for better from-scratch training.
+    Cross-attention adapter is injected between self-attention and FFN, same as DecoderLayer.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        cross_attn_type: str = "softmax",
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.cross_attn_type = cross_attn_type
+        head_dim = hidden_size // num_heads
+
+        self.attention_norm = RMSNorm(hidden_size)
+        self.attention = Attention(
+            dim=hidden_size,
+            head_dim=head_dim,
+            n_heads=num_heads,
+            n_kv_heads=num_heads,
+            rope_theta=10000.0,
+        )
+        # Cross-attention adapter: LayerNorm + residual handled inside adapter
+        if cross_attn_type == "softmax":
+            self.cross_attn_module = CrossAttentionAdapter(hidden_size, num_heads, dropout)
+        else:
+            self.cross_attn_module = LinearCrossAttentionAdapter(
+                hidden_size, num_heads, dropout, variant=cross_attn_type
+            )
+        self.ffn_norm = RMSNorm(hidden_size)
+        self.feed_forward = FeedForward(
+            dim=hidden_size,
+            hidden_dim=hidden_size * 4,
+            multiple_of=256,
+            ffn_dim_multiplier=None,
+        )
+
+    def forward(
+        self,
+        x,
+        freq_cis,
+        encoder_output,
+        encoder_padding_mask=None,
+        return_attn=False,
+    ):
+        # Pre-norm self-attention + residual (Llama style)
+        h = x + self.attention(self.attention_norm(x), freq_cis, mask="causal")
+
+        # Cross-attention adapter (handles its own norm + residual internally)
+        if return_attn:
+            h, cross_attn_weights = self.cross_attn_module(
+                h, encoder_output, encoder_padding_mask, return_attn=True
+            )
+        else:
+            h = self.cross_attn_module(h, encoder_output, encoder_padding_mask)
+            cross_attn_weights = None
+
+        # Pre-norm FFN + residual
+        out = h + self.feed_forward(self.ffn_norm(h))
+
+        if return_attn:
+            return out, cross_attn_weights
+        return out
+
+    def init_weights(self, init_std: float, factor: float):
+        """Lingua-style init: truncated normal, output projections scaled by factor."""
+
+        def tn(w, std):
+            nn.init.trunc_normal_(w, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+        # Self-attention (wq, wk, wv normal; wo scaled by factor)
+        out_std = init_std / factor
+        for w in [self.attention.wq, self.attention.wk, self.attention.wv]:
+            tn(w.weight, init_std)
+        tn(self.attention.wo.weight, out_std)
+
+        # Cross-attention adapter
+        self.cross_attn_module.init_weights(init_std, factor)
+
+        # FFN (w1, w3 normal; w2 scaled by factor)
+        ffn_out_std = (self.feed_forward.hidden_dim ** -0.5) / factor
+        tn(self.feed_forward.w1.weight, init_std)
+        tn(self.feed_forward.w3.weight, init_std)
+        tn(self.feed_forward.w2.weight, ffn_out_std)
+
+        # RMSNorm has no bias — just reset weight to ones
+        nn.init.ones_(self.attention_norm.weight)
+        nn.init.ones_(self.ffn_norm.weight)
+
+
 class CrossAttentionAdapter(nn.Module):
     """Cross-attention adapter injected between self-attention and FFN of a frozen decoder layer.
 
@@ -834,9 +937,14 @@ class LinearCrossAttentionAdapter(nn.Module):
             # Replaces the old rank-bottleneck alpha_down/alpha_up pair.
             self.g_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=True)
             self.beta_proj = nn.Linear(hidden_size, num_heads, bias=True)
-            # Zero-init: logsigmoid(0) = -log2 ≈ -0.693 → moderate initial decay rate
+            # Init g_proj bias to 5.0: logsigmoid(5.0) ≈ -0.0067 per position → near-zero decay at init.
+            # With zero bias, cumsum over 64 tokens = 64 × (-0.693) ≈ -44.4, exp(-44.4) ≈ 0 → state collapse.
+            # With bias=5.0, cumsum over 64 tokens ≈ -0.43 → exp ≈ 0.65 (healthy initial retention).
             nn.init.zeros_(self.g_proj.weight)
-            nn.init.zeros_(self.g_proj.bias)
+            nn.init.constant_(self.g_proj.bias, 5.0)
+            # Zero-init beta_proj: consistent gate behavior at initialization
+            nn.init.zeros_(self.beta_proj.weight)
+            nn.init.zeros_(self.beta_proj.bias)
 
         # Zero-init output projection: adapter starts as identity (no-op)
         nn.init.zeros_(self.out_proj.weight)
@@ -952,8 +1060,12 @@ class LinearCrossAttentionAdapter(nn.Module):
                     safe_gate=True,           # enable M=16 TensorCore path
                     lower_bound=-5.0,         # logsigmoid gates are always < 0, -5 is safe
                 )
-                # final_state: [B, H, d_k, d_k] (float32) — cast to match Q dtype
-                S = final_state.to(Q.dtype)
+                # final_state: [B, H, d_k, d_k] (float32) — keep in fp32 for matmul
+                # to avoid precision loss from bfloat16 downcast before the multiply.
+                # Normalize for consistency with fallback path: as training progresses,
+                # S can grow arbitrarily (K is L2-normed but operator norm of S is unbounded),
+                # making Q @ S unbounded and causing gradient instability.
+                O = F.normalize(torch.matmul(Q.float(), final_state), p=2, dim=-1).to(Q.dtype)  # [B, H, T_dec, d_k]
 
             else:
                 # ── Fallback path: Python outer loop + batched triangular solve ──
@@ -990,11 +1102,16 @@ class LinearCrossAttentionAdapter(nn.Module):
                     # solve_triangular doesn't support bfloat16; cast to float32 and back
                     _A = A.float()
                     _eye = eye_BT.float()
-                    A = torch.linalg.solve_triangular(
-                        _eye[None, None] - _A,
-                        _eye[None, None].expand(B, H, -1, -1),
-                        upper=False,
-                    ).to(K.dtype) * b_c.unsqueeze(-1)
+                    # FLA naive_chunk_kda line 75: A = (I + solve_triangular(...)) * beta
+                    # The identity term accounts for each token reading its own V contribution.
+                    A = (
+                        eye_BT[None, None].to(K.dtype) +
+                        torch.linalg.solve_triangular(
+                            _eye[None, None] - _A,
+                            _eye[None, None].expand(B, H, -1, -1),
+                            upper=False,
+                        ).to(K.dtype)
+                    ) * b_c.unsqueeze(-2)
 
                     # Inter-chunk aggregates
                     w = torch.matmul(A, K_g)
@@ -1006,9 +1123,9 @@ class LinearCrossAttentionAdapter(nn.Module):
                     K_w = K_c * (g_last[:, :, None, :] - g_cum).exp()
                     S = S + torch.matmul(K_w.transpose(-2, -1), v_new)
 
-            # Decode: all decoder queries read from the final encoder state.
-            # Q and K are L2-normalised by _feature_map, providing implicit normalisation.
-            O = torch.matmul(Q, S)                      # [B, H, T_dec, d_k]
+                # Fallback path: normalize because S can grow unbounded without the
+                # FLA kernel's decay normalization. Q/K are already L2-normed.
+                O = F.normalize(torch.matmul(Q, S), p=2, dim=-1)  # [B, H, T_dec, d_k]
 
         # Merge heads and project
         O = O.transpose(1, 2).contiguous().view(B, T_dec, D)  # (B, T_dec, D)
@@ -1033,9 +1150,9 @@ class LinearCrossAttentionAdapter(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
 
         if self.variant == "linear_kda":
-            # g_proj already zero-inited in __init__; reinforce here for robustness
+            # g_proj already inited in __init__; reinforce here for robustness
             nn.init.zeros_(self.g_proj.weight)
-            nn.init.zeros_(self.g_proj.bias)
+            nn.init.constant_(self.g_proj.bias, 5.0)
             nn.init.zeros_(self.beta_proj.weight)
             nn.init.zeros_(self.beta_proj.bias)
 
@@ -1235,14 +1352,18 @@ class UnifiedModel(nn.Module):
         self.decoder_embed.weight.is_pretrained = True
         self.decoder_embed.weight.is_pretrained_decoder = True
 
-        self.pos_embed = nn.Embedding(max_seq_len, self.hidden_size)
+        # RoPE frequencies as a buffer (no learnable parameters, replaces learned pos_embed)
+        head_dim = self.hidden_size // num_heads
+        freq_cis = precompute_freqs_cis(head_dim, max_seq_len)
+        self.register_buffer("freq_cis", freq_cis, persistent=False)
+
         self.decoder_layers = nn.ModuleList(
             [
-                DecoderLayer(self.hidden_size, num_heads, dropout, cross_attn_type=cross_attn_type)
+                LlamaDecoderLayer(self.hidden_size, num_heads, dropout, cross_attn_type=cross_attn_type)
                 for _ in range(num_decoder_layers)
             ]
         )
-        self.output_norm = nn.LayerNorm(self.hidden_size)
+        self.output_norm = RMSNorm(self.hidden_size)
         self.output_proj = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
         self.output_proj.weight = self.decoder_embed.weight
 
@@ -1440,17 +1561,16 @@ class UnifiedModel(nn.Module):
             for layer in self.decoder_layers:
                 layer.init_weights(std, factor)
 
-            # Embeddings (skip if inherited from encoder)
-            for name in ["decoder_embed", "pos_embed"]:
+            # Embeddings (skip if inherited from encoder; pos_embed replaced by RoPE buffer)
+            for name in ["decoder_embed"]:
                 if hasattr(self, name):
                     weight = getattr(self, name).weight
                     if not getattr(weight, "is_pretrained", False):
                         tn(weight)
 
-            # LayerNorm
+            # RMSNorm (no bias)
             if hasattr(self, "output_norm"):
                 nn.init.ones_(self.output_norm.weight)
-                nn.init.zeros_(self.output_norm.bias)
 
         # Pretrained decoder: init cross-attention adapters + encoder projection
         if hasattr(self, "cross_attn_adapters"):
@@ -1590,21 +1710,18 @@ class UnifiedModel(nn.Module):
             return_attn: If True, also returns list of cross-attention weights per layer.
         """
         dec_seq_len = decoder_input_ids.shape[1]
-        positions = torch.arange(dec_seq_len, device=decoder_input_ids.device)
-        x = self.decoder_embed(decoder_input_ids) + self.pos_embed(positions)
+        x = self.decoder_embed(decoder_input_ids)
 
-        causal_mask = torch.triu(
-            torch.ones(dec_seq_len, dec_seq_len, device=x.device, dtype=torch.bool),
-            diagonal=1,
-        )
+        # RoPE frequencies for this sequence length
+        freq_cis = self.freq_cis[:dec_seq_len].to(x.device)
 
         cross_attn_weights = [] if return_attn else None
         for layer in self.decoder_layers:
             if return_attn:
                 x, attn = layer(
                     x,
+                    freq_cis,
                     encoder_output,
-                    causal_mask=causal_mask,
                     encoder_padding_mask=encoder_attention_mask.bool(),
                     return_attn=True,
                 )
@@ -1612,8 +1729,8 @@ class UnifiedModel(nn.Module):
             else:
                 x = layer(
                     x,
+                    freq_cis,
                     encoder_output,
-                    causal_mask=causal_mask,
                     encoder_padding_mask=encoder_attention_mask.bool(),
                 )
 

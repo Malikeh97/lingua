@@ -370,19 +370,19 @@ ibash
 #     --batch_size 8"
 # submit "$RUN_NAME" "$COMMAND"
 
-# # C/Q//A linear_kda FLA finetune: ModernBERT 400M (trained 0.333x) + TinyLlama (trained 0.333x)
-export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_v2_finetune_3"
-export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
-    --wandb_run_name $RUN_NAME \
-    --data_format C/Q//A \
-    --model_type encdec \
-    --model_name modernbert_400m \
-    --decoder_model_name tinyllama_1b \
-    --cross_attn_type linear_kda \
-    --pretrained_weight_updating 0.333 \
-    --epochs 2 \
-    --batch_size 8"
-submit "$RUN_NAME" "$COMMAND"
+# # # C/Q//A linear_kda FLA finetune: ModernBERT 400M (trained 0.333x) + TinyLlama (trained 0.333x)
+# export RUN_NAME="modernbert400m_tinyllama1b_cq_a_linear_kda_fla_v2_finetune_3"
+# export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
+#     --wandb_run_name $RUN_NAME \
+#     --data_format C/Q//A \
+#     --model_type encdec \
+#     --model_name modernbert_400m \
+#     --decoder_model_name tinyllama_1b \
+#     --cross_attn_type linear_kda \
+#     --pretrained_weight_updating 0.333 \
+#     --epochs 2 \
+#     --batch_size 8"
+# submit "$RUN_NAME" "$COMMAND"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # From-scratch decoder: softmax vs linear_kda (6-layer and 12-layer)
@@ -390,32 +390,88 @@ submit "$RUN_NAME" "$COMMAND"
 # Mirrors the architecture in main.py; cross_attn_type controls attention variant.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 
 
-# # C/Q//A softmax 22-layer from-scratch (baseline, matches TinyLlama depth)
-# export RUN_NAME="modernbert400m_scratch22l_cq_a_softmax"
-# export COMMAND="python -m apps.minimal_squad.cepe \
-#     --wandb_run_name $RUN_NAME \
-#     --data_format C/Q//A \
-#     --model_type encdec \
-#     --model_name modernbert_400m \
-#     --cross_attn_type softmax \
-#     --num_decoder_layers 22 \
-#     --pretrained_weight_updating 0.333 \
-#     --epochs 5 \
-#     --batch_size 8"
-# submit "$RUN_NAME" "$COMMAND"
 
-# # C/Q//A linear_kda 22-layer from-scratch
-# export RUN_NAME="modernbert400m_scratch22l_cq_a_linear_kda"
-# export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
-#     --wandb_run_name $RUN_NAME \
-#     --data_format C/Q//A \
-#     --model_type encdec \
-#     --model_name modernbert_400m \
-#     --cross_attn_type linear_kda \
-#     --num_decoder_layers 22 \
-#     --pretrained_weight_updating 0.333 \
-#     --epochs 5 \
-#     --batch_size 8"
-# submit "$RUN_NAME" "$COMMAND"
+# C/Q//A softmax 6-layer from-scratch (baseline, matches TinyLlama depth)
+export RUN_NAME="modernbert400m_scratch6l_cq_a_softmax"
+export COMMAND="python -m apps.minimal_squad.cepe \
+    --wandb_run_name $RUN_NAME \
+    --data_format C/Q//A \
+    --model_type encdec \
+    --model_name modernbert_400m \
+    --cross_attn_type softmax \
+    --num_decoder_layers 6 \
+    --pretrained_weight_updating 0.333 \
+    --epochs 5 \
+    --batch_size 8"
+submit "$RUN_NAME" "$COMMAND"
+
+# C/Q//A linear_kda 6-layer from-scratch
+export RUN_NAME="modernbert400m_scratch6l_cq_a_linear_kda"
+export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
+    --wandb_run_name $RUN_NAME \
+    --data_format C/Q//A \
+    --model_type encdec \
+    --model_name modernbert_400m \
+    --cross_attn_type linear_kda \
+    --num_decoder_layers 6 \
+    --pretrained_weight_updating 0.333 \
+    --epochs 5 \
+    --batch_size 8"
+submit "$RUN_NAME" "$COMMAND"
+
+# C/Q//A softmax 12-layer from-scratch (baseline, matches TinyLlama depth)
+export RUN_NAME="modernbert400m_scratch12l_cq_a_softmax"
+export COMMAND="python -m apps.minimal_squad.cepe \
+    --wandb_run_name $RUN_NAME \
+    --data_format C/Q//A \
+    --model_type encdec \
+    --model_name modernbert_400m \
+    --cross_attn_type softmax \
+    --num_decoder_layers 12 \
+    --pretrained_weight_updating 0.333 \
+    --epochs 5 \
+    --batch_size 8"
+submit "$RUN_NAME" "$COMMAND"
+
+# C/Q//A linear_kda 12-layer from-scratch
+export RUN_NAME="modernbert400m_scratch12l_cq_a_linear_kda"
+export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
+    --wandb_run_name $RUN_NAME \
+    --data_format C/Q//A \
+    --model_type encdec \
+    --model_name modernbert_400m \
+    --cross_attn_type linear_kda \
+    --num_decoder_layers 12 \
+    --pretrained_weight_updating 0.333 \
+    --epochs 5 \
+    --batch_size 8"
+submit "$RUN_NAME" "$COMMAND"
+
+# C/Q//A softmax 22-layer from-scratch (baseline, matches TinyLlama depth)
+export RUN_NAME="modernbert400m_scratch22l_cq_a_softmax"
+export COMMAND="python -m apps.minimal_squad.cepe \
+    --wandb_run_name $RUN_NAME \
+    --data_format C/Q//A \
+    --model_type encdec \
+    --model_name modernbert_400m \
+    --cross_attn_type softmax \
+    --num_decoder_layers 22 \
+    --pretrained_weight_updating 0.333 \
+    --epochs 5 \
+    --batch_size 8"
+submit "$RUN_NAME" "$COMMAND"
+
+# C/Q//A linear_kda 22-layer from-scratch
+export RUN_NAME="modernbert400m_scratch22l_cq_a_linear_kda"
+export COMMAND="PYTHONPATH=apps/minimal_squad/flash-linear-attention:\$PYTHONPATH python -m apps.minimal_squad.cepe \
+    --wandb_run_name $RUN_NAME \
+    --data_format C/Q//A \
+    --model_type encdec \
+    --model_name modernbert_400m \
+    --cross_attn_type linear_kda \
+    --num_decoder_layers 22 \
+    --pretrained_weight_updating 0.333 \
+    --epochs 5 \
+    --batch_size 8"
+submit "$RUN_NAME" "$COMMAND"
