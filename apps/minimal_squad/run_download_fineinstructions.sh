@@ -15,7 +15,7 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
 fi
 
 OUT_DIR="/scratch/ehghaghi/fineinstructions"
-NUM_SAMPLES="1000"   # ~1M context tokens at avg ~2000 tokens/sample; set to 0 to use MAX_FRACTION instead
+NUM_SAMPLES="1500000"   # ~1M context tokens at avg ~2000 tokens/sample; set to 0 to use MAX_FRACTION instead
 MAX_FRACTION="0.0001"  # used only when NUM_SAMPLES=0
 MIN_TOKENS="1000"         # 0 = no minimum
 MAX_TOKENS="8000"         # 0 = no maximum

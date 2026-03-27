@@ -33,7 +33,9 @@ Usage:
 """
 
 import argparse
+import json
 import re
+import sqlite3
 import string
 from collections import Counter
 from dataclasses import dataclass
@@ -72,6 +74,70 @@ try:
 except ImportError:
     _FLA_AVAILABLE = False
 print(f"[cepe] FLA available: {_FLA_AVAILABLE}", flush=True)
+
+
+# ============== Dataset Loaders ==============
+
+
+def load_fineinstructions(dataset_dir: str):
+    """
+    Load FineInstructions dataset from local JSONL files.
+
+    Files expected:
+      {dataset_dir}/train.jsonl
+      {dataset_dir}/val.jsonl
+      {dataset_dir}/contexts.db  (SQLite: contexts(warc_record_id TEXT, text TEXT))
+
+    Samples with empty context are filled from contexts.db via warc_record_id.
+    Only wids that appear in empty-context samples are queried (memory-efficient).
+
+    Returns dict with 'train' and 'validation' HuggingFace Dataset objects.
+    """
+    from datasets import Dataset
+
+    dataset_dir = _os.path.expanduser(dataset_dir)
+    db_path = _os.path.join(dataset_dir, "contexts.db")
+
+    def load_split(jsonl_path):
+        samples = []
+        with open(jsonl_path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    samples.append(json.loads(line))
+        return samples
+
+    def fill_contexts(samples):
+        need_fill = {
+            s["warc_record_id"]: i
+            for i, s in enumerate(samples)
+            if not s.get("context", "").strip() and s.get("warc_record_id")
+        }
+        if not need_fill or not _os.path.exists(db_path):
+            return samples
+        conn = sqlite3.connect(db_path)
+        try:
+            placeholders = ",".join("?" * len(need_fill))
+            rows = conn.execute(
+                f"SELECT warc_record_id, text FROM contexts"
+                f" WHERE warc_record_id IN ({placeholders})",
+                list(need_fill.keys()),
+            ).fetchall()
+        finally:
+            conn.close()
+        wid_to_text = dict(rows)
+        for wid, idx in need_fill.items():
+            if wid in wid_to_text:
+                samples[idx] = dict(samples[idx], context=wid_to_text[wid])
+        return samples
+
+    train_samples = fill_contexts(load_split(_os.path.join(dataset_dir, "train.jsonl")))
+    val_samples = fill_contexts(load_split(_os.path.join(dataset_dir, "val.jsonl")))
+    print(f"Loaded FineInstructions: {len(train_samples)} train, {len(val_samples)} val")
+    return {
+        "train": Dataset.from_list(train_samples),
+        "validation": Dataset.from_list(val_samples),
+    }
 
 
 # ============== Data Preparation ==============
@@ -2203,18 +2269,52 @@ def compute_f1(prediction, ground_truth):
     return (2 * precision * recall) / (precision + recall)
 
 
-def evaluate_predictions(predictions, ground_truths):
-    exact_matches, f1_scores = [], []
+def compute_rouge_l(prediction: str, ground_truth: str) -> float:
+    """Compute ROUGE-L F1 using LCS on normalized token sequences."""
+    pred_tokens = normalize_answer(prediction).split()
+    gold_tokens = normalize_answer(ground_truth).split()
+    if not pred_tokens or not gold_tokens:
+        return int(pred_tokens == gold_tokens)
+    m, n = len(pred_tokens), len(gold_tokens)
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        curr = [0] * (n + 1)
+        for j in range(1, n + 1):
+            if pred_tokens[i - 1] == gold_tokens[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(prev[j], curr[j - 1])
+        prev = curr
+    lcs_len = prev[n]
+    if lcs_len == 0:
+        return 0.0
+    precision = lcs_len / m
+    recall = lcs_len / n
+    return (2 * precision * recall) / (precision + recall)
+
+
+def evaluate_predictions(predictions, ground_truths, dataset_type: str = "squad"):
+    """
+    Compute evaluation metrics.
+    dataset_type='squad':       returns exact_match + f1 (primary)
+    dataset_type='generative':  returns rouge_l (primary) + exact_match + f1 (reference)
+    """
+    exact_matches, f1_scores, rouge_l_scores = [], [], []
     for pred, golds in zip(predictions, ground_truths):
         golds = [golds] if isinstance(golds, str) else golds
         em = max(int(normalize_answer(pred) == normalize_answer(g)) for g in golds)
         f1 = max(compute_f1(pred, g) for g in golds)
         exact_matches.append(em)
         f1_scores.append(f1)
-    return {
+        if dataset_type == "generative":
+            rouge_l_scores.append(max(compute_rouge_l(pred, g) for g in golds))
+    metrics = {
         "exact_match": sum(exact_matches) / len(exact_matches) * 100,
         "f1": sum(f1_scores) / len(f1_scores) * 100,
     }
+    if dataset_type == "generative":
+        metrics["rouge_l"] = sum(rouge_l_scores) / len(rouge_l_scores) * 100
+    return metrics
 
 
 # ============== Training Functions ==============
@@ -2249,25 +2349,28 @@ def _get_device(model):
     return next(model.parameters()).device
 
 
-def train_epoch(model, dataloader, optimizer, epoch, use_wandb, eval_callback=None):
+def train_epoch(model, dataloader, optimizer, epoch, use_wandb, eval_callback=None, grad_accumulation_steps=1):
     model.train()
     device = _get_device(model)
     total_loss = 0
     total_steps = len(dataloader)
     eval_interval = max(1, total_steps // 10)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    optimizer.zero_grad()
 
     for step, batch in enumerate(pbar):
         batch = {k: v.to(device) for k, v in batch.items()}
-        optimizer.zero_grad()
         loss = train_step(model, batch)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        (loss / grad_accumulation_steps).backward()
         total_loss += loss.item()
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
         if use_wandb and step % 10 == 0:
             wandb.log({"train/loss": loss.item(), "train/step": step})
+
+        if (step + 1) % grad_accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
 
         # Evaluate every 10% of the epoch steps (skip step 0)
         if eval_callback is not None and step > 0 and step % eval_interval == 0:
@@ -2275,6 +2378,12 @@ def train_epoch(model, dataloader, optimizer, epoch, use_wandb, eval_callback=No
             pbar.write(f"\n[Epoch {epoch} | {pct}% ({step}/{total_steps})] Running validation...")
             eval_callback(epoch=epoch, step=step, total_steps=total_steps)
             model.train()
+
+    # Flush remaining accumulated gradients if steps not divisible by accumulation steps
+    if len(dataloader) % grad_accumulation_steps != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
     return total_loss / len(dataloader)
 
@@ -2298,6 +2407,8 @@ def evaluate_generation(
     preparer: DataPreparer,
     max_samples=None,
     decoder_tokenizer=None,
+    dataset_type: str = "squad",
+    max_new_tokens: int = 64,
 ):
     """Evaluate generation using the same data pipeline as training."""
     if max_samples:
@@ -2352,7 +2463,7 @@ def evaluate_generation(
                 encoder_attention_mask=encoder_attention_mask,
                 decoder_prefix_ids=decoder_prefix_ids,
                 tokenizer=tokenizer,
-                max_new_tokens=64,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
@@ -2376,7 +2487,7 @@ def evaluate_generation(
 
         predictions.append(pred)
 
-    return evaluate_predictions(predictions, ground_truths), predictions, ground_truths
+    return evaluate_predictions(predictions, ground_truths, dataset_type=dataset_type), predictions, ground_truths
 
 
 # ============== Main ==============
@@ -2479,6 +2590,31 @@ def main():
     parser.add_argument("--eval_samples", type=int, default=500)
     parser.add_argument("--wandb_project", type=str, default="minimal_squad")
     parser.add_argument("--wandb_run_name", type=str, default="debug")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="squad",
+        choices=["squad", "fineinstructions"],
+        help="Dataset to train on: 'squad' (default) or 'fineinstructions'",
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default="/scratch/ehghaghi/fineinstructions",
+        help="Path to FineInstructions data directory (used when --dataset=fineinstructions)",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps (default: 1 = no accumulation)",
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=64,
+        help="Max new tokens to generate during evaluation (default: 64; use 256+ for FI)",
+    )
     args = parser.parse_args()
 
     # Parse format
@@ -2495,6 +2631,12 @@ def main():
         raise ValueError(
             f"Data format {args.data_format} indicates span extraction, "
             f"but --span_expr is 'none'. Use --span_expr=bertlike, first_last_hidden, or first_last_attn."
+        )
+    if args.dataset == "fineinstructions" and parsed_format.is_span_extraction:
+        raise ValueError(
+            "FineInstructions is a generative QA dataset with free-form answers. "
+            "Span extraction formats (containing 'S') are not supported. "
+            "Use a generation format such as C/Q//A or Q/C/A."
         )
 
     print(
@@ -2538,21 +2680,28 @@ def main():
             )
 
     # Load dataset
-    print("Loading SQuAD dataset...")
-    dataset = load_dataset("squad")
+    if args.dataset == "fineinstructions":
+        print(f"Loading FineInstructions dataset from {args.dataset_dir}...")
+        dataset = load_fineinstructions(args.dataset_dir)
+        # FI was already filtered by token_count at download time; skip char-length filter
+        dataset_type = "generative"
+    else:
+        print("Loading SQuAD dataset...")
+        dataset = load_dataset("squad")
 
-    # Filter out examples where total length exceeds 2000 characters
-    def filter_by_length(example):
-        q_len = len(example["question"])
-        c_len = len(example["context"])
-        a_len = max((len(ans) for ans in example["answers"]["text"]), default=0)
-        return q_len + c_len + a_len <= 2000
+        # Filter out examples where total length exceeds 2000 characters
+        def filter_by_length(example):
+            q_len = len(example["question"])
+            c_len = len(example["context"])
+            a_len = max((len(ans) for ans in example["answers"]["text"]), default=0)
+            return q_len + c_len + a_len <= 2000
 
-    original_train_size = len(dataset["train"])
-    original_val_size = len(dataset["validation"])
-    dataset = dataset.filter(filter_by_length)
-    print(f"Filtered train: {original_train_size} -> {len(dataset['train'])}")
-    print(f"Filtered val: {original_val_size} -> {len(dataset['validation'])}")
+        original_train_size = len(dataset["train"])
+        original_val_size = len(dataset["validation"])
+        dataset = dataset.filter(filter_by_length)
+        print(f"Filtered train: {original_train_size} -> {len(dataset['train'])}")
+        print(f"Filtered val: {original_val_size} -> {len(dataset['validation'])}")
+        dataset_type = "squad"
 
     # Prepare data
     preparer = DataPreparer(
@@ -2756,8 +2905,8 @@ def main():
         optimizer_grouped_parameters, lr=args.lr, weight_decay=0.01, fused=True
     )
 
-    def run_squad_eval(epoch, step, total_steps):
-        """Run SQuAD validation and log results."""
+    def run_eval(epoch, step, total_steps):
+        """Run validation and log results."""
         val_metrics = evaluate_loss(model, val_loader)
         gen_metrics, predictions, ground_truths = evaluate_generation(
             model,
@@ -2766,22 +2915,32 @@ def main():
             preparer,
             args.eval_samples,
             decoder_tokenizer=decoder_tokenizer,
+            dataset_type=dataset_type,
+            max_new_tokens=args.max_new_tokens,
         )
         pct = int(round(step / total_steps * 100)) if total_steps > 0 else 100
-        print(
-            f"[Epoch {epoch} | {pct}%] Val loss: {val_metrics['loss']:.4f} | "
-            f"EM: {gen_metrics['exact_match']:.2f}% | F1: {gen_metrics['f1']:.2f}%"
-        )
-        if use_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "epoch_pct": pct,
-                    "val/loss": val_metrics["loss"],
-                    "val/exact_match": gen_metrics["exact_match"],
-                    "val/f1": gen_metrics["f1"],
-                }
+        if dataset_type == "generative":
+            print(
+                f"[Epoch {epoch} | {pct}%] Val loss: {val_metrics['loss']:.4f} | "
+                f"ROUGE-L: {gen_metrics['rouge_l']:.2f}%  "
+                f"EM: {gen_metrics['exact_match']:.2f}%  F1: {gen_metrics['f1']:.2f}% (ref)"
             )
+        else:
+            print(
+                f"[Epoch {epoch} | {pct}%] Val loss: {val_metrics['loss']:.4f} | "
+                f"EM: {gen_metrics['exact_match']:.2f}% | F1: {gen_metrics['f1']:.2f}%"
+            )
+        if use_wandb:
+            log_dict = {
+                "epoch": epoch,
+                "epoch_pct": pct,
+                "val/loss": val_metrics["loss"],
+                "val/exact_match": gen_metrics["exact_match"],
+                "val/f1": gen_metrics["f1"],
+            }
+            if dataset_type == "generative":
+                log_dict["val/rouge_l"] = gen_metrics["rouge_l"]
+            wandb.log(log_dict)
         print("\n  Samples:")
         for i in range(min(3, len(predictions))):
             sample = dataset["validation"][i]
@@ -2796,12 +2955,14 @@ def main():
     print("\nStarting training...")
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
-            model, train_loader, optimizer, epoch, use_wandb, eval_callback=run_squad_eval
+            model, train_loader, optimizer, epoch, use_wandb,
+            eval_callback=run_eval,
+            grad_accumulation_steps=args.gradient_accumulation_steps,
         )
         print(f"Epoch {epoch} - Train loss: {train_loss:.4f}")
 
         # End-of-epoch evaluation (100%)
-        val_metrics, gen_metrics = run_squad_eval(
+        val_metrics, gen_metrics = run_eval(
             epoch=epoch, step=len(train_loader), total_steps=len(train_loader)
         )
 
