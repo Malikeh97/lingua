@@ -28,6 +28,7 @@ dependencies = [
     "ninja",
     "pip",
     "einops",
+    "ray[default]",
 ]
 
 [build-system]
