@@ -1,0 +1,61 @@
+# Debug configuration for FineSearch encoder-decoder
+# Small/fast run for testing: 1k steps, small sequences
+
+name: finesearch_debug
+dump_dir: outputs/finesearch_debug
+seed: 42
+
+# Training
+steps: 1000
+grad_acc_steps: 1
+log_interval: 10
+eval_interval: 500
+gc_collect_freq: 100
+
+# Model
+model:
+  model_type: encdec
+  encoder_name: answerdotai/ModernBERT-base
+  encoder_max_len: 512
+  freeze_encoder: false
+  decoder_name: ""
+  decoder_max_len: 128
+  num_decoder_layers: 4
+  cross_attn_layers: "all"
+  cross_attn_heads: 8
+  cross_attn_type: softmax
+
+# Data
+data:
+  tasks:
+    - squad
+  weights:
+    - 1.0
+  target_tokens: 8192
+  batch_size: 8
+  packer_buffer_size: 20
+  seed: 42
+
+# Optimizer
+optim:
+  lr: 1e-4
+  weight_decay: 0.01
+  warmup: 100
+  lr_min_ratio: 0.01
+  clip: 1.0
+
+# Distributed
+distributed:
+  fsdp_type: no_shard
+  compile: false
+  model_dtype: bf16
+
+# Checkpointing
+checkpoint:
+  dump:
+    every: 500
+    keep: 2
+
+# Logging
+logging:
+  freq: 10

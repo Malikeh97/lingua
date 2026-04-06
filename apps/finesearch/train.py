@@ -11,18 +11,19 @@ import gc
 import logging
 import os
 import sys
+import types
+import dataclasses
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from timeit import default_timer as timer
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type, TypeVar, get_type_hints
 
+import yaml
 import torch
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from tqdm import tqdm
-
-from lingua.args import dataclass_from_dict, dump_config
 from lingua.checkpoint import CheckpointArgs, CheckpointManager
 from lingua.distributed import (
     get_is_master,
@@ -107,6 +108,16 @@ class TrainConfig:
 preemption_flag = dict(flag=False)
 
 
+class TrainState:
+    """Simple train state compatible with CheckpointManager."""
+
+    def __init__(self, step: int = 0):
+        self.step = step
+
+    def state_dict(self):
+        return {"step": self.step}
+
+
 def set_preemption_flag(signum, frame):
     logger.warning("Signal handler called with signal " + str(signum))
     logger.warning("Preemption! Checkpointing and exiting.")
@@ -131,9 +142,12 @@ def build_tokenizers(model_args: ModelArgs, data_args: DataArgs):
     # Encoder tokenizer from model.encoder_name
     encoder_tokenizer = AutoTokenizer.from_pretrained(model_args.encoder_name)
 
-    # Decoder tokenizer from model.decoder_name, fallback to default if empty
-    decoder_name = model_args.decoder_name or data_args.default_decoder_tokenizer
-    decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_name)
+    # Decoder tokenizer: use pretrained decoder's tokenizer if available,
+    # otherwise reuse encoder tokenizer (from-scratch decoder shares encoder embeddings)
+    if model_args.decoder_name:
+        decoder_tokenizer = AutoTokenizer.from_pretrained(model_args.decoder_name)
+    else:
+        decoder_tokenizer = encoder_tokenizer
 
     return encoder_tokenizer, decoder_tokenizer
 
@@ -226,7 +240,7 @@ def train(cfg: TrainConfig):
         # Setup distributed
         if get_is_master():
             os.makedirs(cfg.dump_dir, exist_ok=True)
-            dump_config(cfg, Path(cfg.dump_dir) / "config.yaml")
+            _dump_config_yaml(cfg, Path(cfg.dump_dir) / "config.yaml")
 
         init_logger(Path(cfg.dump_dir) / "train.log")
         init_signal_handler(set_preemption_flag)
@@ -245,7 +259,11 @@ def train(cfg: TrainConfig):
         # Build model
         logger.info("Building model")
         model = build_model(cfg.model)
-        model = model.to(cfg.trainer.device)
+
+        # Apply model dtype from distributed config
+        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+        model_dtype = dtype_map.get(cfg.distributed.model_dtype, torch.float32)
+        model = model.to(device=cfg.trainer.device, dtype=model_dtype)
 
         model_param_count = get_num_params(model)
         logger.info(f"Model size: {model_param_count:,} parameters")
@@ -280,6 +298,10 @@ def train(cfg: TrainConfig):
 
         # Checkpoint manager
         checkpoint = CheckpointManager.instantiate_and_make_dir(cfg.checkpoint)
+
+        # Convert config to OmegaConf-safe dict for checkpointing
+        # (Literal type annotations not supported by OmegaConf.structured)
+        cfg_dict = OmegaConf.create(dataclasses.asdict(cfg))
 
         # Metric logger
         metric_logger = context_stack.enter_context(
@@ -397,7 +419,7 @@ def train(cfg: TrainConfig):
                 # Checkpointing
                 saved = False
                 if step % cfg.checkpoint.dump.every == 0:
-                    saved = checkpoint.save(model, optimizer, {"step": step}, cfg)
+                    saved = checkpoint.save(model, optimizer, TrainState(step=step), cfg_dict)
 
                 # Evaluation
                 if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
@@ -444,26 +466,76 @@ def train(cfg: TrainConfig):
                 # Preemption handling
                 if preemption_flag["flag"]:
                     if not saved:
-                        checkpoint.save(model, optimizer, {"step": step}, cfg)
+                        checkpoint.save(model, optimizer, TrainState(step=step), cfg_dict)
                     requeue_slurm_job()
                     sys.exit(0)
 
         pbar.close()
 
         # Final checkpoint
-        checkpoint.save(model, optimizer, {"step": step}, cfg)
+        checkpoint.save(model, optimizer, TrainState(step=step), cfg_dict)
         logger.info(f"Training complete. Final step: {step}")
 
     gc.collect()
 
 
+T = TypeVar("T")
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base."""
+    result = base.copy()
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def _dataclass_defaults(cls) -> dict:
+    """Extract defaults from a dataclass, recursing into nested dataclasses."""
+    result = {}
+    for f in dataclasses.fields(cls):
+        if dataclasses.is_dataclass(f.type):
+            result[f.name] = _dataclass_defaults(f.type)
+        elif f.default is not dataclasses.MISSING:
+            result[f.name] = f.default
+        elif f.default_factory is not dataclasses.MISSING:
+            result[f.name] = f.default_factory()
+    return result
+
+
+def _dict_to_dataclass(cls: Type[T], data: dict) -> T:
+    """Convert a dict to a dataclass, recursing into nested dataclasses."""
+    kwargs = {}
+    field_types = {f.name: f.type for f in dataclasses.fields(cls)}
+    for k, v in data.items():
+        ft = field_types.get(k)
+        if ft and dataclasses.is_dataclass(ft) and isinstance(v, dict):
+            kwargs[k] = _dict_to_dataclass(ft, v)
+        else:
+            kwargs[k] = v
+    return cls(**kwargs)
+
+
+def _dump_config_yaml(cfg, path):
+    """Dump dataclass config to YAML without OmegaConf.structured()."""
+    d = dataclasses.asdict(cfg) if dataclasses.is_dataclass(cfg) else cfg
+    yaml_str = yaml.dump(d, default_flow_style=False, sort_keys=False)
+    logger.info("Using the following config for this run:")
+    logger.info(yaml_str)
+    with open(path, "w") as f:
+        f.write(yaml_str)
+
+
 def main():
     """
-    CLI uses OmegaConf for config loading with overrides.
+    CLI uses OmegaConf only for YAML loading and CLI parsing (no structured()).
 
     Usage:
-        python -m apps.finesearch.train config=configs/finesearch/train.yaml
-        python -m apps.finesearch.train config=train.yaml model.encoder_name=bert-base
+        python -m apps.finesearch.train config=apps/finesearch/configs/debug.yaml
+        python -m apps.finesearch.train config=debug.yaml model.encoder_name=bert-base
     """
     cli_args = OmegaConf.from_cli()
 
@@ -471,13 +543,15 @@ def main():
         print("Usage: python -m apps.finesearch.train config=<config.yaml> [overrides]")
         sys.exit(1)
 
-    file_cfg = OmegaConf.load(cli_args.config)
+    file_cfg = OmegaConf.to_container(OmegaConf.load(cli_args.config), resolve=True)
     del cli_args.config
+    cli_overrides = OmegaConf.to_container(cli_args, resolve=True)
 
-    default_cfg = OmegaConf.structured(TrainConfig())
-    cfg = OmegaConf.merge(default_cfg, file_cfg, cli_args)
-    cfg = OmegaConf.to_object(cfg)
+    defaults = _dataclass_defaults(TrainConfig)
+    merged = _deep_merge(defaults, file_cfg)
+    merged = _deep_merge(merged, cli_overrides)
 
+    cfg = _dict_to_dataclass(TrainConfig, merged)
     train(cfg)
 
 

@@ -101,4 +101,70 @@ class TokenizedBatch:
         2. Tokenize queries + targets -> decoder_tokens + labels
         3. Map document_hashes to indices
         """
-        raise NotImplementedError
+        # 1. Tokenize deduplicated documents
+        # Assign a stable index to each unique doc hash
+        doc_hash_to_idx: Dict[str, int] = {}
+        doc_tensors: List[torch.Tensor] = []
+
+        for doc_hash, doc_text in batch.documents.items():
+            doc_hash_to_idx[doc_hash] = len(doc_tensors)
+            enc = encoder_tokenizer(
+                doc_text,
+                max_length=encoder_max_len,
+                truncation=True,
+                return_tensors="pt",
+                add_special_tokens=True,
+            )
+            doc_tensors.append(enc["input_ids"].squeeze(0))
+
+        encoder_tokens = PackedSequences.from_tensors(doc_tensors, device)
+
+        # 2. Tokenize queries + targets -> decoder tokens + labels
+        dec_tensors: List[torch.Tensor] = []
+        label_tensors: List[torch.Tensor] = []
+        example_doc_indices: List[List[int]] = []
+
+        for i in range(len(batch)):
+            query = batch.queries[i]
+            target = batch.target_texts[i]
+
+            # Tokenize query and target separately to know boundary
+            query_enc = decoder_tokenizer(
+                query,
+                add_special_tokens=True,
+                return_tensors="pt",
+            )
+            target_enc = decoder_tokenizer(
+                target,
+                add_special_tokens=False,
+                return_tensors="pt",
+            )
+            query_ids = query_enc["input_ids"].squeeze(0)
+            target_ids = target_enc["input_ids"].squeeze(0)
+
+            # Concatenate and truncate to decoder_max_len
+            full_ids = torch.cat([query_ids, target_ids], dim=0)[:decoder_max_len]
+
+            # Labels: -100 for query portion, target ids for the rest
+            query_len = min(query_ids.shape[0], decoder_max_len)
+            labels = full_ids.clone()
+            labels[:query_len] = -100
+
+            dec_tensors.append(full_ids)
+            label_tensors.append(labels)
+
+            # Map this example's doc hashes to indices
+            example_doc_indices.append(
+                [doc_hash_to_idx[h] for h in batch.document_hashes[i]]
+            )
+
+        decoder_tokens = PackedSequences.from_tensors(dec_tensors, device)
+        all_labels = torch.cat(label_tensors, dim=0).to(device)
+
+        return cls(
+            encoder_tokens=encoder_tokens,
+            doc_hash_to_idx=doc_hash_to_idx,
+            decoder_tokens=decoder_tokens,
+            labels=all_labels,
+            example_doc_indices=example_doc_indices,
+        )

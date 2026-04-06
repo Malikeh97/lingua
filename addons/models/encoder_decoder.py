@@ -397,20 +397,49 @@ class EncoderDecoder(nn.Module):
         seqlen = decoder_tokens.shape[0]
 
         h = self.decoder_tok_embeddings(decoder_tokens)
-        freq_cis = self.decoder_rope(seqlen=seqlen)
+
+        # Build per-token position indices for packed sequences
+        # Each sub-sequence restarts positions from 0
+        cu = batch.decoder_tokens.cu_seqlens
+        tok_idx = torch.zeros(seqlen, dtype=torch.long, device=decoder_tokens.device)
+        for i in range(len(batch.decoder_tokens.lengths)):
+            start = cu[i].item()
+            end = cu[i + 1].item()
+            tok_idx[start:end] = torch.arange(end - start, device=decoder_tokens.device)
+        freq_cis = self.decoder_rope(tok_idx=tok_idx)
 
         # Get cu_seqlens for packed attention
         cu_seqlens_q = batch.decoder_tokens.cu_seqlens
-        cu_seqlens_kv = batch.encoder_tokens.cu_seqlens
         max_seqlen_q = batch.decoder_tokens.max_seqlen
-        max_seqlen_kv = batch.encoder_tokens.max_seqlen
+
+        # Build per-example cross-attention KV from encoder outputs
+        # Each decoder example attends to its specific documents
+        enc_cu = batch.encoder_tokens.cu_seqlens
+        kv_chunks = []
+        kv_lengths = []
+        for doc_indices in batch.example_doc_indices:
+            example_kvs = []
+            for idx in doc_indices:
+                s = enc_cu[idx].item()
+                e = enc_cu[idx + 1].item()
+                example_kvs.append(encoder_output[s:e])
+            cat = torch.cat(example_kvs, dim=0) if example_kvs else encoder_output[:0]
+            kv_chunks.append(cat)
+            kv_lengths.append(cat.shape[0])
+
+        cross_kv = torch.cat(kv_chunks, dim=0)
+        cu_seqlens_kv = torch.tensor(
+            [0] + list(torch.cumsum(torch.tensor(kv_lengths), dim=0)),
+            dtype=torch.int32, device=decoder_tokens.device,
+        )
+        max_seqlen_kv = max(kv_lengths) if kv_lengths else 0
 
         if hasattr(self, "decoder_layers"):
             # From-scratch decoder with integrated cross-attention
             for layer in self.decoder_layers:
                 h = layer(
                     h.unsqueeze(0) if h.dim() == 2 else h,
-                    encoder_output.unsqueeze(0) if encoder_output.dim() == 2 else encoder_output,
+                    cross_kv.unsqueeze(0) if cross_kv.dim() == 2 else cross_kv,
                     freq_cis,
                     cu_seqlens_q,
                     cu_seqlens_kv,
@@ -431,7 +460,7 @@ class EncoderDecoder(nn.Module):
 
                 # Cross-attention adapter
                 h = cross_attn(
-                    h, encoder_output,
+                    h, cross_kv,
                     cu_seqlens_q, cu_seqlens_kv,
                     max_seqlen_q, max_seqlen_kv,
                 )

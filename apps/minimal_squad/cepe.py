@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Unified script for generative QA on SQuAD with configurable data formats.
-Initialization with pretrained models is implemented inspired by CEPE-style cross-attention adapters for efficient encoder-decoder adaptation: 
+Initialization with pretrained models is implemented inspired by CEPE-style cross-attention adapters for efficient encoder-decoder adaptation:
 https://arxiv.org/pdf/2402.16617
 
 Format Grammar:
@@ -70,6 +70,7 @@ if _fla_path not in _sys.path:
     _sys.path.insert(0, _fla_path)
 try:
     from fla.ops.kda import chunk_kda as _chunk_kda
+
     _FLA_AVAILABLE = True
 except ImportError:
     _FLA_AVAILABLE = False
@@ -133,7 +134,9 @@ def load_fineinstructions(dataset_dir: str):
 
     train_samples = fill_contexts(load_split(_os.path.join(dataset_dir, "train.jsonl")))
     val_samples = fill_contexts(load_split(_os.path.join(dataset_dir, "val.jsonl")))
-    print(f"Loaded FineInstructions: {len(train_samples)} train, {len(val_samples)} val")
+    print(
+        f"Loaded FineInstructions: {len(train_samples)} train, {len(val_samples)} val"
+    )
     return {
         "train": Dataset.from_list(train_samples),
         "validation": Dataset.from_list(val_samples),
@@ -258,8 +261,12 @@ class DataPreparer:
         self.eos_id = tokenizer.eos_token_id or tokenizer.sep_token_id
 
         # Cache special token IDs for decoder tokenizer
-        self.dec_bos_id = self.decoder_tokenizer.bos_token_id or self.decoder_tokenizer.cls_token_id
-        self.dec_eos_id = self.decoder_tokenizer.eos_token_id or self.decoder_tokenizer.sep_token_id
+        self.dec_bos_id = (
+            self.decoder_tokenizer.bos_token_id or self.decoder_tokenizer.cls_token_id
+        )
+        self.dec_eos_id = (
+            self.decoder_tokenizer.eos_token_id or self.decoder_tokenizer.sep_token_id
+        )
 
         # Part prefixes (boilerplate) - these never have loss
         # Note: Q/C/A are just format notation, prefixes are human-readable
@@ -745,7 +752,9 @@ class DecoderLayer(nn.Module):
         # out_proj is zero-initialized so cross-attention starts as a no-op, letting
         # the model first learn from self-attention then gradually use encoder context.
         if cross_attn_type == "softmax":
-            self.cross_attn_module = CrossAttentionAdapter(hidden_size, num_heads, dropout)
+            self.cross_attn_module = CrossAttentionAdapter(
+                hidden_size, num_heads, dropout
+            )
         else:
             self.cross_attn_module = LinearCrossAttentionAdapter(
                 hidden_size, num_heads, dropout, variant=cross_attn_type
@@ -846,7 +855,9 @@ class LlamaDecoderLayer(nn.Module):
         )
         # Cross-attention adapter: LayerNorm + residual handled inside adapter
         if cross_attn_type == "softmax":
-            self.cross_attn_module = CrossAttentionAdapter(hidden_size, num_heads, dropout)
+            self.cross_attn_module = CrossAttentionAdapter(
+                hidden_size, num_heads, dropout
+            )
         else:
             self.cross_attn_module = LinearCrossAttentionAdapter(
                 hidden_size, num_heads, dropout, variant=cross_attn_type
@@ -902,7 +913,7 @@ class LlamaDecoderLayer(nn.Module):
         self.cross_attn_module.init_weights(init_std, factor)
 
         # FFN (w1, w3 normal; w2 scaled by factor)
-        ffn_out_std = (self.feed_forward.hidden_dim ** -0.5) / factor
+        ffn_out_std = (self.feed_forward.hidden_dim**-0.5) / factor
         tn(self.feed_forward.w1.weight, init_std)
         tn(self.feed_forward.w3.weight, init_std)
         tn(self.feed_forward.w2.weight, ffn_out_std)
@@ -988,7 +999,9 @@ class LinearCrossAttentionAdapter(nn.Module):
         self.variant = variant
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        assert (
+            hidden_size % num_heads == 0
+        ), "hidden_size must be divisible by num_heads"
 
         self.cross_attn_norm = nn.LayerNorm(hidden_size)
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -1037,13 +1050,17 @@ class LinearCrossAttentionAdapter(nn.Module):
         d_k = self.head_dim
 
         # Project Q, K, V and reshape to (B, H, T, d_k)
-        Q = self.q_proj(x).view(B, T_dec, H, d_k).transpose(1, 2)           # (B, H, T_dec, d_k)
-        K = self.k_proj(encoder_output).view(B, T_enc, H, d_k).transpose(1, 2)  # (B, H, T_enc, d_k)
-        V = self.v_proj(encoder_output).view(B, T_enc, H, d_k).transpose(1, 2)  # (B, H, T_enc, d_k)
+        Q = self.q_proj(x).view(B, T_dec, H, d_k).transpose(1, 2)  # (B, H, T_dec, d_k)
+        K = (
+            self.k_proj(encoder_output).view(B, T_enc, H, d_k).transpose(1, 2)
+        )  # (B, H, T_enc, d_k)
+        V = (
+            self.v_proj(encoder_output).view(B, T_enc, H, d_k).transpose(1, 2)
+        )  # (B, H, T_enc, d_k)
 
         # Apply feature maps
-        Q = self._feature_map(Q)   # (B, H, T_dec, d_k)
-        K = self._feature_map(K)   # (B, H, T_enc, d_k)
+        Q = self._feature_map(Q)  # (B, H, T_dec, d_k)
+        K = self._feature_map(K)  # (B, H, T_enc, d_k)
         V = torch.nn.functional.silu(V)  # (B, H, T_enc, d_k)
 
         if self.variant == "linear":
@@ -1082,29 +1099,33 @@ class LinearCrossAttentionAdapter(nn.Module):
 
             # Log-space per-element decay gates: [B, T_enc, H*d_k] → [B, H, T_enc, d_k]
             g_log = F.logsigmoid(self.g_proj(encoder_output))
-            g_log = g_log.view(B, T_enc, H, d_k).permute(0, 2, 1, 3)   # [B, H, T_enc, d_k]
+            g_log = g_log.view(B, T_enc, H, d_k).permute(
+                0, 2, 1, 3
+            )  # [B, H, T_enc, d_k]
 
             # Per-head write gate: [B, T_enc, H] → [B, H, T_enc]
             beta_val = torch.sigmoid(self.beta_proj(encoder_output))
-            beta_val = beta_val.permute(0, 2, 1)                         # [B, H, T_enc]
+            beta_val = beta_val.permute(0, 2, 1)  # [B, H, T_enc]
 
             # Zero-out padded encoder positions before any accumulation
             if encoder_padding_mask is not None:
-                pad_m = encoder_padding_mask[:, None, :, None].to(K.dtype)  # [B, 1, T_enc, 1]
+                pad_m = encoder_padding_mask[:, None, :, None].to(
+                    K.dtype
+                )  # [B, 1, T_enc, 1]
                 K = K * pad_m
                 V = V * pad_m
 
             if _FLA_AVAILABLE:
                 # ── Fast path: single fused CUDA kernel via flash-linear-attention ──
                 # Convert [B, H, T, d_k] → [B, T, H, d_k] as expected by chunk_kda.
-                K_enc = K.permute(0, 2, 1, 3).contiguous()       # [B, T_enc, H, d_k]
-                V_enc = V.permute(0, 2, 1, 3).contiguous()       # [B, T_enc, H, d_k]
-                g_enc = g_log.permute(0, 2, 1, 3).contiguous()   # [B, T_enc, H, d_k]
+                K_enc = K.permute(0, 2, 1, 3).contiguous()  # [B, T_enc, H, d_k]
+                V_enc = V.permute(0, 2, 1, 3).contiguous()  # [B, T_enc, H, d_k]
+                g_enc = g_log.permute(0, 2, 1, 3).contiguous()  # [B, T_enc, H, d_k]
                 # Clamp gates to kernel's expected range [-5, 0).
                 # logsigmoid is always < 0; during from-scratch training large negative
                 # weights can push values << -5, causing NaN with safe_gate=True.
                 g_enc = g_enc.clamp(min=-5.0)
-                b_enc = beta_val.permute(0, 2, 1).contiguous()   # [B, T_enc, H]
+                b_enc = beta_val.permute(0, 2, 1).contiguous()  # [B, T_enc, H]
 
                 # chunk_kda requires float32 initial state
                 h0 = K.new_zeros(B, H, d_k, d_k, dtype=torch.float32)
@@ -1122,16 +1143,18 @@ class LinearCrossAttentionAdapter(nn.Module):
                     initial_state=h0,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=False,
-                    disable_recompute=True,   # save intermediates → faster backward
-                    safe_gate=True,           # enable M=16 TensorCore path
-                    lower_bound=-5.0,         # logsigmoid gates are always < 0, -5 is safe
+                    disable_recompute=True,  # save intermediates → faster backward
+                    safe_gate=True,  # enable M=16 TensorCore path
+                    lower_bound=-5.0,  # logsigmoid gates are always < 0, -5 is safe
                 )
                 # final_state: [B, H, d_k, d_k] (float32) — keep in fp32 for matmul
                 # to avoid precision loss from bfloat16 downcast before the multiply.
                 # Normalize for consistency with fallback path: as training progresses,
                 # S can grow arbitrarily (K is L2-normed but operator norm of S is unbounded),
                 # making Q @ S unbounded and causing gradient instability.
-                O = F.normalize(torch.matmul(Q.float(), final_state), p=2, dim=-1).to(Q.dtype)  # [B, H, T_dec, d_k]
+                O = F.normalize(torch.matmul(Q.float(), final_state), p=2, dim=-1).to(
+                    Q.dtype
+                )  # [B, H, T_dec, d_k]
 
             else:
                 # ── Fallback path: Python outer loop + batched triangular solve ──
@@ -1144,21 +1167,22 @@ class LinearCrossAttentionAdapter(nn.Module):
                     t_end = min(t_start + CHUNK, T_enc)
                     BT = t_end - t_start
 
-                    K_c = K[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
-                    V_c = V[:, :, t_start:t_end, :]        # [B, H, BT, d_k]
-                    g_c = g_log[:, :, t_start:t_end, :]    # [B, H, BT, d_k]
-                    b_c = beta_val[:, :, t_start:t_end]    # [B, H, BT]
+                    K_c = K[:, :, t_start:t_end, :]  # [B, H, BT, d_k]
+                    V_c = V[:, :, t_start:t_end, :]  # [B, H, BT, d_k]
+                    g_c = g_log[:, :, t_start:t_end, :]  # [B, H, BT, d_k]
+                    b_c = beta_val[:, :, t_start:t_end]  # [B, H, BT]
 
                     # Intra-chunk cumulative gate
-                    g_cum = g_c.cumsum(dim=2)              # [B, H, BT, d_k]
-                    K_g = K_c * g_cum.exp()                # [B, H, BT, d_k]
+                    g_cum = g_c.cumsum(dim=2)  # [B, H, BT, d_k]
+                    K_g = K_c * g_cum.exp()  # [B, H, BT, d_k]
 
                     # Intra-chunk delta-rule interaction matrix (lower triangular)
-                    A = torch.matmul(K_c, K_g.transpose(-2, -1))   # [B, H, BT, BT]
+                    A = torch.matmul(K_c, K_g.transpose(-2, -1))  # [B, H, BT, BT]
                     A = A * b_c.unsqueeze(-1)
 
                     upper = torch.triu(
-                        torch.ones(BT, BT, dtype=torch.bool, device=K.device), diagonal=0
+                        torch.ones(BT, BT, dtype=torch.bool, device=K.device),
+                        diagonal=0,
                     )
                     A = (-A).masked_fill(upper[None, None], 0.0)
 
@@ -1171,8 +1195,8 @@ class LinearCrossAttentionAdapter(nn.Module):
                     # FLA naive_chunk_kda line 75: A = (I + solve_triangular(...)) * beta
                     # The identity term accounts for each token reading its own V contribution.
                     A = (
-                        eye_BT[None, None].to(K.dtype) +
-                        torch.linalg.solve_triangular(
+                        eye_BT[None, None].to(K.dtype)
+                        + torch.linalg.solve_triangular(
                             _eye[None, None] - _A,
                             _eye[None, None].expand(B, H, -1, -1),
                             upper=False,
@@ -1377,7 +1401,9 @@ class UnifiedModel(nn.Module):
                     decoder_model_name, cross_attn_num_heads, dropout, cross_attn_type
                 )
             else:
-                self._init_decoder(num_decoder_layers, num_heads, dropout, max_seq_len, cross_attn_type)
+                self._init_decoder(
+                    num_decoder_layers, num_heads, dropout, max_seq_len, cross_attn_type
+                )
 
         # Resize embeddings if vocab_size differs (e.g., [SPAN] token added)
         if vocab_size is not None and vocab_size != self.vocab_size:
@@ -1409,7 +1435,14 @@ class UnifiedModel(nn.Module):
                     p.is_pretrained = True
                     p.is_pretrained_decoder = True
 
-    def _init_decoder(self, num_decoder_layers, num_heads, dropout, max_seq_len, cross_attn_type="softmax"):
+    def _init_decoder(
+        self,
+        num_decoder_layers,
+        num_heads,
+        dropout,
+        max_seq_len,
+        cross_attn_type="softmax",
+    ):
         """Initialize decoder components for enc-dec generation."""
         self.decoder_embed = nn.Embedding(self.vocab_size, self.hidden_size)
         with torch.no_grad():
@@ -1425,7 +1458,12 @@ class UnifiedModel(nn.Module):
 
         self.decoder_layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(self.hidden_size, num_heads, dropout, cross_attn_type=cross_attn_type)
+                LlamaDecoderLayer(
+                    self.hidden_size,
+                    num_heads,
+                    dropout,
+                    cross_attn_type=cross_attn_type,
+                )
                 for _ in range(num_decoder_layers)
             ]
         )
@@ -1434,7 +1472,11 @@ class UnifiedModel(nn.Module):
         self.output_proj.weight = self.decoder_embed.weight
 
     def _init_pretrained_decoder(
-        self, decoder_model_name, cross_attn_num_heads, dropout, cross_attn_type: str = "softmax"
+        self,
+        decoder_model_name,
+        cross_attn_num_heads,
+        dropout,
+        cross_attn_type: str = "softmax",
     ):
         """Initialize decoder from a pre-trained causal LM with cross-attention adapters.
 
@@ -1485,7 +1527,12 @@ class UnifiedModel(nn.Module):
 
         self.cross_attn_adapters = nn.ModuleList(
             [
-                adapter_cls(self.decoder_hidden_size, cross_attn_num_heads, dropout, **adapter_kwargs)
+                adapter_cls(
+                    self.decoder_hidden_size,
+                    cross_attn_num_heads,
+                    dropout,
+                    **adapter_kwargs,
+                )
                 for _ in range(self.decoder_num_layers)
             ]
         )
@@ -1553,7 +1600,9 @@ class UnifiedModel(nn.Module):
             # Step 1: Self-attention (frozen)
             residual = x
             x = layer.input_layernorm(x)
-            x = layer.self_attn(x, position_embeddings=position_embeddings, use_cache=False)[0]
+            x = layer.self_attn(
+                x, position_embeddings=position_embeddings, use_cache=False
+            )[0]
             x = residual + x
 
             # Step 2: Cross-attention adapter (trained)
@@ -1615,13 +1664,11 @@ class UnifiedModel(nn.Module):
         """Lingua-style init: truncated normal ±3σ, output scaling by sqrt(3*n_layers)."""
         # From-scratch decoder init
         if hasattr(self, "decoder_layers"):
-            std = self.hidden_size ** -0.5
+            std = self.hidden_size**-0.5
             factor = (3 * len(self.decoder_layers)) ** 0.5
 
             def tn(weight):
-                nn.init.trunc_normal_(
-                    weight, mean=0.0, std=std, a=-3 * std, b=3 * std
-                )
+                nn.init.trunc_normal_(weight, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
             # Decoder layers
             for layer in self.decoder_layers:
@@ -1640,7 +1687,7 @@ class UnifiedModel(nn.Module):
 
         # Pretrained decoder: init cross-attention adapters + encoder projection
         if hasattr(self, "cross_attn_adapters"):
-            dec_std = self.decoder_hidden_size ** -0.5
+            dec_std = self.decoder_hidden_size**-0.5
             dec_factor = (3 * self.decoder_num_layers) ** 0.5
 
             for adapter in self.cross_attn_adapters:
@@ -1657,7 +1704,7 @@ class UnifiedModel(nn.Module):
 
         # Span heads
         if hasattr(self, "qa_outputs"):
-            std = self.hidden_size ** -0.5
+            std = self.hidden_size**-0.5
             nn.init.trunc_normal_(
                 self.qa_outputs.weight, mean=0.0, std=std, a=-3 * std, b=3 * std
             )
@@ -2349,7 +2396,15 @@ def _get_device(model):
     return next(model.parameters()).device
 
 
-def train_epoch(model, dataloader, optimizer, epoch, use_wandb, eval_callback=None, grad_accumulation_steps=1):
+def train_epoch(
+    model,
+    dataloader,
+    optimizer,
+    epoch,
+    use_wandb,
+    eval_callback=None,
+    grad_accumulation_steps=1,
+):
     model.train()
     device = _get_device(model)
     total_loss = 0
@@ -2375,7 +2430,9 @@ def train_epoch(model, dataloader, optimizer, epoch, use_wandb, eval_callback=No
         # Evaluate every 10% of the epoch steps (skip step 0)
         if eval_callback is not None and step > 0 and step % eval_interval == 0:
             pct = int(round(step / total_steps * 100))
-            pbar.write(f"\n[Epoch {epoch} | {pct}% ({step}/{total_steps})] Running validation...")
+            pbar.write(
+                f"\n[Epoch {epoch} | {pct}% ({step}/{total_steps})] Running validation..."
+            )
             eval_callback(epoch=epoch, step=step, total_steps=total_steps)
             model.train()
 
@@ -2487,7 +2544,11 @@ def evaluate_generation(
 
         predictions.append(pred)
 
-    return evaluate_predictions(predictions, ground_truths, dataset_type=dataset_type), predictions, ground_truths
+    return (
+        evaluate_predictions(predictions, ground_truths, dataset_type=dataset_type),
+        predictions,
+        ground_truths,
+    )
 
 
 # ============== Main ==============
@@ -2666,7 +2727,9 @@ def main():
         resolved_decoder = resolve_model_name(args.decoder_model_name)
         decoder_tokenizer = AutoTokenizer.from_pretrained(resolved_decoder)
         infer_special_tokens(decoder_tokenizer)
-        print(f"Decoder tokenizer: {resolved_decoder} (vocab_size={len(decoder_tokenizer)})")
+        print(
+            f"Decoder tokenizer: {resolved_decoder} (vocab_size={len(decoder_tokenizer)})"
+        )
 
     # Add [SPAN] special token for span extraction modes
     if parsed_format.is_span_extraction:
@@ -2955,7 +3018,11 @@ def main():
     print("\nStarting training...")
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
-            model, train_loader, optimizer, epoch, use_wandb,
+            model,
+            train_loader,
+            optimizer,
+            epoch,
+            use_wandb,
             eval_callback=run_eval,
             grad_accumulation_steps=args.gradient_accumulation_steps,
         )

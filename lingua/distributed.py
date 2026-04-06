@@ -155,7 +155,7 @@ def get_global_rank() -> int:
     if get_is_torch_run():
         return int(os.environ["RANK"])
     elif get_is_slurm_job():
-        return int(os.environ["SLURM_PROCID"])
+        return int(os.environ.get("SLURM_PROCID", "0"))
     else:
         return 0
 
@@ -165,7 +165,7 @@ def get_local_rank() -> int:
     if get_is_torch_run():
         return int(os.environ["LOCAL_RANK"])
     elif get_is_slurm_job():
-        return int(os.environ["SLURM_LOCALID"])
+        return int(os.environ.get("SLURM_LOCALID", "0"))
     else:
         return 0
 
@@ -175,7 +175,7 @@ def get_world_size() -> int:
     if get_is_torch_run():
         return int(os.environ["WORLD_SIZE"])
     elif get_is_slurm_job():
-        return int(os.environ["SLURM_NTASKS"])
+        return int(os.environ.get("SLURM_NTASKS", "1"))
     else:
         return 1
 
