@@ -18,6 +18,11 @@ class SQUADTask(BaseTask):
     Single-document extractive question answering.
     """
 
+    # When True, query is prepended to the document (encoder side) so the
+    # decoder only generates the answer.  This gives C/Q//A format which
+    # performs much better than C//Q/A (~80% vs ~20% EM).
+    query_in_encoder: bool = True
+
     @property
     def name(self) -> str:
         return "squad"
@@ -37,6 +42,7 @@ class SQUADTask(BaseTask):
                 max_examples: Optional cap on examples
                 shuffle: Whether to shuffle (default True for train)
                 seed: Random seed for shuffling
+                query_in_encoder: Put query in encoder (default True)
         """
         # Load dataset
         dataset = load_dataset("squad", split=split)
@@ -52,10 +58,17 @@ class SQUADTask(BaseTask):
         if max_examples is not None:
             dataset = dataset.select(range(min(max_examples, len(dataset))))
 
+        # Query placement flag
+        query_in_encoder = kwargs.get("query_in_encoder", cls.query_in_encoder)
+
         return {
             "dataset": dataset,
             "idx": 0,
+            "epoch": 0,
+            "split": split,
+            "seed": seed,
             "exhausted": False,
+            "query_in_encoder": query_in_encoder,
         }
 
     @classmethod
@@ -69,22 +82,48 @@ class SQUADTask(BaseTask):
         idx = state["idx"]
         examples = []
 
+        query_in_encoder = state.get("query_in_encoder", cls.query_in_encoder)
+
         end_idx = min(idx + batch_size, len(dataset))
         for i in range(idx, end_idx):
             raw = dataset[i]
-            ex = cls._map_example(raw)
+            ex = cls._map_example(raw, query_in_encoder=query_in_encoder)
             examples.append(ex)
 
-        new_state = {
-            **state,
-            "idx": end_idx,
-            "exhausted": end_idx >= len(dataset),
-        }
+        split = state.get("split", "train")
+
+        if end_idx >= len(dataset) and split == "train":
+            # Start new epoch: reset idx, bump epoch, re-shuffle
+            epoch = state.get("epoch", 0) + 1
+            base_seed = state.get("seed", 42)
+            new_state = {
+                **state,
+                "dataset": dataset.shuffle(seed=base_seed + epoch),
+                "idx": 0,
+                "epoch": epoch,
+                "exhausted": False,
+            }
+        else:
+            new_state = {
+                **state,
+                "idx": end_idx,
+                "exhausted": end_idx >= len(dataset),
+            }
         return examples, new_state
 
     @classmethod
-    def _map_example(cls, raw: Dict[str, Any]) -> ContextBasedExample:
-        """Transform SQUAD example to unified schema."""
+    def _map_example(
+        cls, raw: Dict[str, Any], query_in_encoder: bool = True
+    ) -> ContextBasedExample:
+        """Transform SQUAD example to unified schema.
+
+        When query_in_encoder=True (default), the question is prepended to the
+        context document so both go through the encoder (C/Q//A format).
+        The decoder query is left empty and only generates the answer.
+
+        When query_in_encoder=False, the question stays in the decoder query
+        field (C//Q/A format).
+        """
         context = raw["context"]
         question = raw["question"]
         answers = raw["answers"]
@@ -92,9 +131,18 @@ class SQUADTask(BaseTask):
         # Use first answer as target, store all for multi-ref evaluation
         target_text = answers["text"][0] if answers["text"] else ""
 
+        if query_in_encoder:
+            # C/Q//A: question + context → encoder, answer → decoder
+            document = f"{question}\n\n{context}"
+            query = ""
+        else:
+            # C//Q/A: context → encoder, question + answer → decoder
+            document = context
+            query = question
+
         return ContextBasedExample.from_raw(
-            documents=[context],
-            query=question,
+            documents=[document],
+            query=query,
             target_text=target_text,
             example_id=raw["id"],
             source="squad",

@@ -71,19 +71,25 @@ class ContextBasedExample:
         """Retrieve documents in order."""
         return [self.documents[h] for h in self.document_hashes]
 
-    def estimate_tokens(self, chars_per_token: float = 4.0) -> int:
+    def estimate_tokens(
+        self,
+        chars_per_token: float = 4.0,
+        enc_cost: float = 1.0,
+        dec_cost: float = 1.0,
+    ) -> int:
         """
-        Estimate total tokens for bin-packing.
+        Estimate weighted token cost for bin-packing.
 
-        Counts: all documents + query + target + instruction.
-        Uses character count / chars_per_token as approximation.
+        Encoder tokens (documents) weighted by enc_cost,
+        decoder tokens (query + target) weighted by dec_cost.
         """
-        total_chars = sum(len(d) for d in self.documents.values())
-        total_chars += len(self.query)
-        total_chars += len(self.target_text)
+        enc_chars = sum(len(d) for d in self.documents.values())
+        dec_chars = len(self.query) + len(self.target_text)
         if self.instruction:
-            total_chars += len(self.instruction)
-        return int(total_chars / chars_per_token)
+            dec_chars += len(self.instruction)
+        enc_tokens = enc_chars / chars_per_token
+        dec_tokens = dec_chars / chars_per_token
+        return int(enc_tokens * enc_cost + dec_tokens * dec_cost)
 
 
 @dataclass
@@ -196,15 +202,22 @@ class BatchedContextBasedExamples:
         for i in range(len(self)):
             yield self[i]
 
-    def estimate_tokens(self, chars_per_token: float = 4.0) -> int:
+    def estimate_tokens(
+        self,
+        chars_per_token: float = 4.0,
+        enc_cost: float = 1.0,
+        dec_cost: float = 1.0,
+    ) -> int:
         """
-        Estimate total tokens for bin-packing.
+        Estimate weighted token cost for bin-packing.
 
-        Counts: all documents + all queries + all targets + all instructions.
-        Uses character count / chars_per_token as approximation.
+        Encoder tokens (documents) weighted by enc_cost,
+        decoder tokens (queries + targets) weighted by dec_cost.
         """
-        total_chars = sum(len(d) for d in self.documents.values())
-        total_chars += sum(len(q) for q in self.queries)
-        total_chars += sum(len(t) for t in self.target_texts)
-        total_chars += sum(len(i) for i in self.instructions if i)
-        return int(total_chars / chars_per_token)
+        enc_chars = sum(len(d) for d in self.documents.values())
+        dec_chars = sum(len(q) for q in self.queries)
+        dec_chars += sum(len(t) for t in self.target_texts)
+        dec_chars += sum(len(i) for i in self.instructions if i)
+        enc_tokens = enc_chars / chars_per_token
+        dec_tokens = dec_chars / chars_per_token
+        return int(enc_tokens * enc_cost + dec_tokens * dec_cost)

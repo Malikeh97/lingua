@@ -1,0 +1,49 @@
+# Training config for debug run
+# Inherits model from debug.yaml
+
+seed: 42
+
+# Training
+steps: 5000
+grad_acc_steps: 1
+log_interval: 100
+eval_interval: 1000
+gc_collect_freq: 1000
+
+# Data
+data:
+  tasks:
+    - squad
+  weights:
+    - 1.0
+  target_tokens: 8192
+  batch_size: 16
+  packer_buffer_size: 20
+  seed: 42
+
+# Optimizer
+optim:
+  lr: 0.0003
+  weight_decay: 0.01
+  warmup: 500
+  lr_min_ratio: 0.01
+  clip: 1.0
+
+# Distributed
+distributed:
+  fsdp_type: no_shard
+  compile: false
+  model_dtype: bf16
+
+# Checkpointing
+checkpoint:
+  dump:
+    every: 1000
+    keep: 5
+
+# Logging
+logging:
+  freq: 100
+  wandb:
+    project: finesearch
+    name: debug

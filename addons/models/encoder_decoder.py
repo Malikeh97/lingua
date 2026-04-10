@@ -2,7 +2,10 @@
 Encoder-decoder transformer model.
 """
 
+import os
 from typing import Optional
+
+_DEBUG = os.environ.get("DEBUG") == "1"
 
 import torch
 import torch.nn as nn
@@ -187,6 +190,7 @@ class EncoderDecoder(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        self._debug_cross_attn_printed = False
         self._init_encoder(args)
         self._init_decoder(args)
 
@@ -339,6 +343,9 @@ class EncoderDecoder(nn.Module):
         """
         Encode input documents.
 
+        Unpacks documents from cu_seqlens, pads into [num_docs, max_doc_len]
+        for the HF encoder, then repacks into [total_enc_tokens, hidden_dim].
+
         Args:
             batch: TokenizedBatch containing encoder_tokens
             sp_group: sequence parallel group
@@ -346,23 +353,39 @@ class EncoderDecoder(nn.Module):
         Returns:
             encoder_hidden: [total_enc_tokens, hidden_dim]
         """
-        tokens = batch.encoder_tokens.tokens
-        attention_mask = (tokens != 0).long()  # Simple padding mask
+        packed = batch.encoder_tokens
+        device = packed.tokens.device
+        num_docs = packed.num_seqs
 
-        # HF expects [B, T]
-        if tokens.dim() == 1:
-            tokens = tokens.unsqueeze(0)
-            attention_mask = attention_mask.unsqueeze(0)
+        if num_docs == 0:
+            dim = self.encoder_dim
+            return torch.zeros(0, dim, device=device, dtype=packed.tokens.dtype)
 
+        # Unpack into individual doc tensors using cu_seqlens
+        max_len = packed.max_seqlen
+        input_ids = torch.zeros(num_docs, max_len, dtype=packed.tokens.dtype, device=device)
+        attention_mask = torch.zeros(num_docs, max_len, dtype=torch.long, device=device)
+
+        for i in range(num_docs):
+            s = packed.cu_seqlens[i].item()
+            e = packed.cu_seqlens[i + 1].item()
+            length = e - s
+            input_ids[i, :length] = packed.tokens[s:e]
+            attention_mask[i, :length] = 1
+
+        # Encode [num_docs, max_doc_len]
         outputs = self.encoder(
-            input_ids=tokens,
+            input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        hidden = outputs.last_hidden_state
+        hidden = outputs.last_hidden_state  # [num_docs, max_doc_len, dim]
 
-        # Flatten back to packed format
-        if hidden.dim() == 3:
-            hidden = hidden.view(-1, hidden.shape[-1])
+        # Repack: extract non-padded tokens back to [total_enc_tokens, dim]
+        chunks = []
+        for i in range(num_docs):
+            length = packed.lengths[i]
+            chunks.append(hidden[i, :length])
+        hidden = torch.cat(chunks, dim=0)
 
         # Project to decoder dim if needed
         if hasattr(self, "encoder_projection") and self.encoder_projection is not None:
@@ -434,6 +457,19 @@ class EncoderDecoder(nn.Module):
         )
         max_seqlen_kv = max(kv_lengths) if kv_lengths else 0
 
+        if _DEBUG and not self._debug_cross_attn_printed:
+            self._debug_cross_attn_printed = True
+            dec_cu = cu_seqlens_q
+            print("[cross-attn DEBUG] First forward pass mapping:")
+            print(f"  decoder: {len(batch.decoder_tokens.lengths)} seqs, cu_seqlens_q={dec_cu.tolist()}")
+            print(f"  encoder kv: {len(kv_lengths)} chunks, cu_seqlens_kv={cu_seqlens_kv.tolist()}")
+            for i in range(min(2, len(batch.decoder_tokens.lengths))):
+                dq_s, dq_e = dec_cu[i].item(), dec_cu[i + 1].item()
+                kv_s, kv_e = cu_seqlens_kv[i].item(), cu_seqlens_kv[i + 1].item()
+                print(f"  example[{i}]: dec_tokens[{dq_s}:{dq_e}] ({dq_e - dq_s} tokens) "
+                      f"attends to enc_kv[{kv_s}:{kv_e}] ({kv_e - kv_s} tokens) "
+                      f"from docs {batch.example_doc_indices[i]}")
+
         if hasattr(self, "decoder_layers"):
             # From-scratch decoder with integrated cross-attention
             for layer in self.decoder_layers:
@@ -474,24 +510,25 @@ class EncoderDecoder(nn.Module):
         self,
         batch: TokenizedBatch,
         gen_args: GenerationArgs,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Generate tokens given encoded documents.
 
+        Single-example only. Stops at eos_token_id if provided.
+
         Args:
-            batch: TokenizedBatch with encoder_tokens and query prefix
+            batch: TokenizedBatch with a single example
             gen_args: generation configuration
+            eos_token_id: stop generation when this token is produced
 
         Returns:
-            output_ids: [batch_size, max_new_tokens]
+            output_ids: [1, seq_len] generated token ids
         """
-        # Pre-compute encoder output
-        encoder_output = self.encode(batch)
-
         tokens = batch.decoder_tokens.tokens.clone()
+        prompt_len = tokens.shape[0]
 
         for _ in range(gen_args.max_new_tokens):
-            # Forward pass
             logits = self.forward(batch)
             next_logits = logits[-1]
 
@@ -509,10 +546,16 @@ class EncoderDecoder(nn.Module):
             else:
                 next_token = next_logits.argmax(dim=-1, keepdim=True)
 
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+
             tokens = torch.cat([tokens, next_token], dim=0)
             batch.decoder_tokens.tokens = tokens
+            batch.decoder_tokens.lengths[-1] += 1
+            batch.decoder_tokens.cu_seqlens[-1] = tokens.shape[0]
 
-        return tokens.unsqueeze(0)
+        # Return only generated tokens (strip prompt)
+        return tokens[prompt_len:].unsqueeze(0)
 
     @classmethod
     def from_pretrained(

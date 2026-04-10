@@ -4,10 +4,14 @@ Collation utilities for packed sequences.
 Framework-agnostic - pure PyTorch, no distributed imports.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import torch
+
+_DEBUG = os.environ.get("DEBUG") == "1"
+_debug_printed = False
 
 from addons.tasks.schema import BatchedContextBasedExamples
 
@@ -128,10 +132,14 @@ class TokenizedBatch:
             query = batch.queries[i]
             target = batch.target_texts[i]
 
-            # Tokenize query and target separately to know boundary
+            # Tokenize query and target without special tokens
+            # We manage BOS/EOS explicitly: [BOS] query_tokens target_tokens [EOS]
+            bos_id = decoder_tokenizer.cls_token_id or decoder_tokenizer.bos_token_id
+            eos_id = decoder_tokenizer.sep_token_id or decoder_tokenizer.eos_token_id
+
             query_enc = decoder_tokenizer(
                 query,
-                add_special_tokens=True,
+                add_special_tokens=False,
                 return_tensors="pt",
             )
             target_enc = decoder_tokenizer(
@@ -142,11 +150,20 @@ class TokenizedBatch:
             query_ids = query_enc["input_ids"].squeeze(0)
             target_ids = target_enc["input_ids"].squeeze(0)
 
-            # Concatenate and truncate to decoder_max_len
-            full_ids = torch.cat([query_ids, target_ids], dim=0)[:decoder_max_len]
+            # Build: [BOS] query target [EOS]
+            parts = []
+            if bos_id is not None:
+                parts.append(torch.tensor([bos_id]))
+            parts.append(query_ids)
+            prompt_len = sum(p.shape[0] for p in parts)
+            parts.append(target_ids)
+            if eos_id is not None:
+                parts.append(torch.tensor([eos_id]))
 
-            # Labels: -100 for query portion, target ids for the rest
-            query_len = min(query_ids.shape[0], decoder_max_len)
+            full_ids = torch.cat(parts, dim=0)[:decoder_max_len]
+
+            # Labels: -100 for prompt (BOS + query), predict target + EOS
+            query_len = min(prompt_len, decoder_max_len)
             labels = full_ids.clone()
             labels[:query_len] = -100
 
@@ -158,6 +175,31 @@ class TokenizedBatch:
                 [doc_hash_to_idx[h] for h in batch.document_hashes[i]]
             )
 
+        global _debug_printed
+        if _DEBUG and not _debug_printed:
+            _debug_printed = True
+            print("[collate DEBUG] First batch tokenization:")
+            print(f"  bos_id={bos_id}, eos_id={eos_id}")
+            print(f"  num_examples={len(batch)}, num_unique_docs={len(batch.documents)}")
+            print(f"  encoder: {len(doc_tensors)} docs, lengths={[t.shape[0] for t in doc_tensors]}")
+            print(f"  decoder: {len(dec_tensors)} seqs, lengths={[t.shape[0] for t in dec_tensors]}")
+            for j in range(min(2, len(dec_tensors))):
+                print(f"  --- example[{j}] ---")
+                print(f"    source: {batch.sources[j]}")
+                print(f"    query: {batch.queries[j]!r}")
+                print(f"    target: {batch.target_texts[j]!r}")
+                print(f"    num_docs: {len(batch.document_hashes[j])}")
+                doc_idx = example_doc_indices[j][0]
+                print(f"    enc_ids[0]: {doc_tensors[doc_idx].tolist()[:20]}...")
+                enc_text = decoder_tokenizer.decode(doc_tensors[doc_idx], skip_special_tokens=False)
+                if len(enc_text) > 400:
+                    enc_text = enc_text[:200] + " ... " + enc_text[-200:]
+                print(f"    enc_decoded[0]: {enc_text!r}")
+                print(f"    dec_ids: {dec_tensors[j].tolist()}")
+                print(f"    dec_decoded: {decoder_tokenizer.decode(dec_tensors[j], skip_special_tokens=False)!r}")
+                print(f"    labels:  {label_tensors[j].tolist()}")
+                print(f"    doc_indices: {example_doc_indices[j]}")
+
         decoder_tokens = PackedSequences.from_tensors(dec_tensors, device)
         all_labels = torch.cat(label_tensors, dim=0).to(device)
 
@@ -167,4 +209,29 @@ class TokenizedBatch:
             decoder_tokens=decoder_tokens,
             labels=all_labels,
             example_doc_indices=example_doc_indices,
+        )
+
+    def prompt_only(self) -> "TokenizedBatch":
+        """
+        Strip target tokens, keeping only the prompt (where labels == -100).
+
+        Used at generation time: the model receives the prompt and generates the rest.
+        """
+        device = self.decoder_tokens.tokens.device
+        cu = self.decoder_tokens.cu_seqlens
+        prompt_tensors = []
+
+        for i in range(self.decoder_tokens.num_seqs):
+            s = cu[i].item()
+            e = cu[i + 1].item()
+            seq_labels = self.labels[s:e]
+            prompt_len = (seq_labels == -100).sum().item()
+            prompt_tensors.append(self.decoder_tokens.tokens[s:s + prompt_len])
+
+        return TokenizedBatch(
+            encoder_tokens=self.encoder_tokens,
+            doc_hash_to_idx=self.doc_hash_to_idx,
+            decoder_tokens=PackedSequences.from_tensors(prompt_tensors, device),
+            labels=torch.tensor([], device=device),  # no labels at generation
+            example_doc_indices=self.example_doc_indices,
         )

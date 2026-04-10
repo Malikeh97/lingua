@@ -2,7 +2,8 @@
 Evaluation script for FineSearch encoder-decoder.
 
 Usage:
-    python -m apps.finesearch.eval config=configs/finesearch/eval.yaml
+    python -m apps.finesearch.eval config=apps/finesearch/configs/debug.yaml \
+        eval.ckpt_dir=outputs/finesearch_debug/checkpoints/step_2000
 
 Supports:
 - Task-specific metrics (F1, EM, ROUGE, etc.)
@@ -12,7 +13,6 @@ Supports:
 
 import json
 import logging
-import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,14 +20,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from lingua.args import dataclass_from_dict, dump_config
-from lingua.checkpoint import CONSOLIDATE_FOLDER, consolidate_checkpoints
+from lingua.checkpoint import consolidate_checkpoints
 from lingua.distributed import (
     get_global_rank,
-    get_world_size,
     setup_torch_distributed,
 )
 
@@ -40,8 +37,7 @@ from addons.models.encoder_decoder import EncoderDecoder
 from addons.models.decoder import Decoder
 from addons.data.collate import TokenizedBatch
 from addons.tasks.registry import get_task, list_tasks
-from addons.tasks.base import BaseTask
-from addons.tasks.schema import ContextBasedExample
+from addons.tasks.schema import BatchedContextBasedExamples, ContextBasedExample
 
 logger = logging.getLogger()
 
@@ -95,21 +91,16 @@ def load_model_and_tokenizers(cfg: EvalConfig):
     """Load model from checkpoint and build tokenizers."""
     ckpt_path = Path(cfg.eval.ckpt_dir)
 
-    # Check for consolidated checkpoint
-    if (ckpt_path / "params.json").exists():
-        consolidate_path = ckpt_path
-    else:
-        consolidate_path = ckpt_path / CONSOLIDATE_FOLDER
-        if not consolidate_path.exists() and get_global_rank() == 0:
-            consolidate_path = consolidate_checkpoints(str(ckpt_path))
+    consolidate_path = consolidate_checkpoints(str(ckpt_path))
 
     # Load training config to infer model args
     params_path = consolidate_path / "params.json"
     if params_path.exists():
-        train_cfg = OmegaConf.load(params_path)
-        # Override model args from training config
-        if hasattr(train_cfg, "model"):
-            cfg.model = dataclass_from_dict(ModelArgs, train_cfg.model, strict=False)
+        with open(params_path) as f:
+            train_params = json.load(f)
+        if "model" in train_params and isinstance(train_params["model"], dict):
+            from apps.finesearch.config_utils import dict_to_dataclass
+            cfg.model = dict_to_dataclass(ModelArgs, train_params["model"])
 
     # Build model
     if cfg.model.model_type == "encdec":
@@ -119,21 +110,22 @@ def load_model_and_tokenizers(cfg: EvalConfig):
 
     # Load weights
     ckpt_file = consolidate_path / "consolidated.pth"
-    if ckpt_file.exists():
-        state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=True)
-        if "model" in state_dict:
-            model.load_state_dict(state_dict["model"])
-        elif "model_state_dict" in state_dict:
-            model.load_state_dict(state_dict["model_state_dict"])
-        else:
-            model.load_state_dict(state_dict)
+    state_dict = torch.load(ckpt_file, map_location="cpu", weights_only=True)
+    if "model" in state_dict:
+        model.load_state_dict(state_dict["model"])
+    elif "model_state_dict" in state_dict:
+        model.load_state_dict(state_dict["model_state_dict"])
+    else:
+        model.load_state_dict(state_dict)
 
-    model = model.to(cfg.eval.device).eval()
+    model = model.to(device=cfg.eval.device, dtype=torch.bfloat16).eval()
 
-    # Build tokenizers from model args
+    # Build tokenizers
     encoder_tokenizer = AutoTokenizer.from_pretrained(cfg.model.encoder_name)
-    decoder_name = cfg.model.decoder_name or cfg.default_decoder_tokenizer
-    decoder_tokenizer = AutoTokenizer.from_pretrained(decoder_name)
+    if cfg.model.decoder_name:
+        decoder_tokenizer = AutoTokenizer.from_pretrained(cfg.model.decoder_name)
+    else:
+        decoder_tokenizer = encoder_tokenizer
 
     return model, encoder_tokenizer, decoder_tokenizer
 
@@ -144,7 +136,7 @@ def load_model_and_tokenizers(cfg: EvalConfig):
 @torch.inference_mode()
 def generate_predictions(
     model: torch.nn.Module,
-    examples: List[ContextBasedExample],
+    batch: BatchedContextBasedExamples,
     encoder_tokenizer,
     decoder_tokenizer,
     cfg: EvalConfig,
@@ -152,106 +144,47 @@ def generate_predictions(
     """
     Generate predictions for a batch of examples.
 
-    Returns list of generated strings.
+    Tokenizes into TokenizedBatch, runs model.generate(), decodes output.
     """
     device = torch.device(cfg.eval.device)
-    gen_args = cfg.generation
 
-    # Tokenize inputs
-    # For encoder: tokenize documents
-    # For decoder: tokenize query as prompt
+    tokenized = TokenizedBatch.from_batched_examples(
+        batch,
+        encoder_tokenizer,
+        decoder_tokenizer,
+        cfg.model.encoder_max_len,
+        cfg.model.decoder_max_len,
+        device,
+    ).prompt_only()
 
-    predictions = []
+    eos_id = getattr(decoder_tokenizer, "sep_token_id", None) or getattr(decoder_tokenizer, "eos_token_id", None)
 
-    for example in examples:
-        # Encode documents
-        doc_texts = example.documents
-        doc_tokens = [
-            encoder_tokenizer.encode(doc, truncation=True, max_length=cfg.model.encoder_max_len)
-            for doc in doc_texts
-        ]
-
-        # Encode query as decoder prompt
-        query_tokens = decoder_tokenizer.encode(
-            example.query,
-            truncation=True,
-            max_length=cfg.model.decoder_max_len // 2,
-        )
-
-        # Create minimal batch for single example
-        # This is a simplified version - full implementation would use TokenizedBatch
-        encoder_input = torch.tensor(
-            [t for doc in doc_tokens for t in doc], device=device
-        ).unsqueeze(0)
-        decoder_input = torch.tensor(query_tokens, device=device).unsqueeze(0)
-
-        # Generate
-        if hasattr(model, "generate"):
-            output_ids = model.generate(
-                encoder_input=encoder_input,
-                decoder_input=decoder_input,
-                max_new_tokens=gen_args.max_new_tokens,
-                temperature=gen_args.temperature,
-                top_p=gen_args.top_p,
-                do_sample=gen_args.do_sample,
+    if hasattr(model, "generate"):
+        output_ids = model.generate(tokenized, cfg.generation, eos_token_id=eos_id)
+        # output_ids: [1, generated_len] (prompt already stripped)
+        predictions = []
+        for i in range(output_ids.shape[0]):
+            pred = decoder_tokenizer.decode(
+                output_ids[i], skip_special_tokens=True
             )
-            # Decode output
-            pred_text = decoder_tokenizer.decode(
-                output_ids[0, len(query_tokens):],
-                skip_special_tokens=True,
-            )
-        else:
-            # Fallback: use forward pass (for models without generate)
-            pred_text = "[generation not implemented]"
+            predictions.append(pred)
+    else:
+        # Fallback: use forward pass to get greedy predictions
+        logits = model(tokenized)
+        pred_ids = logits.argmax(dim=-1)
 
-        predictions.append(pred_text)
+        # Split by cu_seqlens
+        cu = tokenized.decoder_tokens.cu_seqlens
+        predictions = []
+        for i in range(tokenized.batch_size):
+            start = cu[i].item()
+            end = cu[i + 1].item()
+            pred = decoder_tokenizer.decode(
+                pred_ids[start:end], skip_special_tokens=True
+            )
+            predictions.append(pred)
 
     return predictions
-
-
-# ==================== Metrics ====================
-
-
-def compute_f1(prediction: str, ground_truth: str) -> float:
-    """Compute token-level F1 score."""
-    pred_tokens = prediction.lower().split()
-    gold_tokens = ground_truth.lower().split()
-
-    if not pred_tokens or not gold_tokens:
-        return float(pred_tokens == gold_tokens)
-
-    common = set(pred_tokens) & set(gold_tokens)
-    if not common:
-        return 0.0
-
-    precision = len(common) / len(pred_tokens)
-    recall = len(common) / len(gold_tokens)
-    f1 = 2 * precision * recall / (precision + recall)
-    return f1
-
-
-def compute_exact_match(prediction: str, ground_truth: str) -> float:
-    """Compute exact match score."""
-    return float(prediction.strip().lower() == ground_truth.strip().lower())
-
-
-def compute_metrics(
-    predictions: List[str],
-    references: List[str],
-) -> Dict[str, float]:
-    """Compute evaluation metrics."""
-    f1_scores = []
-    em_scores = []
-
-    for pred, ref in zip(predictions, references):
-        f1_scores.append(compute_f1(pred, ref))
-        em_scores.append(compute_exact_match(pred, ref))
-
-    return {
-        "f1": sum(f1_scores) / len(f1_scores) if f1_scores else 0.0,
-        "exact_match": sum(em_scores) / len(em_scores) if em_scores else 0.0,
-        "num_samples": len(predictions),
-    }
 
 
 # ==================== Evaluation ====================
@@ -259,63 +192,67 @@ def compute_metrics(
 
 def evaluate_task(
     model: torch.nn.Module,
-    task: BaseTask,
+    task_cls: type,
     split: str,
     encoder_tokenizer,
     decoder_tokenizer,
     cfg: EvalConfig,
 ) -> Dict[str, float]:
     """Evaluate model on a single task."""
-    # Initialize task state
-    state = task.init_state(split)
+    state = task_cls.init_state(split, shuffle=False)
 
-    all_predictions = []
-    all_references = []
+    all_predictions: List[str] = []
+    all_miscs: List[Dict[str, Any]] = []
 
     num_samples = 0
     max_samples = cfg.eval.max_samples or float("inf")
 
-    pbar = tqdm(desc=f"Evaluating {task.__class__.__name__}")
+    pbar = tqdm(desc=f"Evaluating {task_cls.__name__}")
 
-    while not task.is_exhausted(state) and num_samples < max_samples:
-        # Read batch of examples
-        examples, state = task.read(state, cfg.eval.batch_size)
+    while not task_cls.is_exhausted(state) and num_samples < max_samples:
+        examples, state = task_cls.read(state, cfg.eval.batch_size)
 
         if not examples:
             break
 
-        # Generate predictions
-        predictions = generate_predictions(
-            model,
-            examples,
-            encoder_tokenizer,
-            decoder_tokenizer,
-            cfg,
-        )
-
-        # Collect predictions and references
-        for example, pred in zip(examples, predictions):
-            all_predictions.append(pred)
-            # Use first answer as reference (for multi-answer, would need to handle differently)
-            if example.answers:
-                all_references.append(example.answers[0])
+        # Flatten to individual examples for misc collection
+        flat_examples: List[ContextBasedExample] = []
+        for unit in examples:
+            if isinstance(unit, ContextBasedExample):
+                flat_examples.append(unit)
             else:
-                all_references.append("")
+                flat_examples.extend(list(unit))
 
-        num_samples += len(examples)
-        pbar.update(len(examples))
+        # Generate one example at a time (generate() doesn't support packed batches)
+        predictions = []
+        for ex in flat_examples:
+            single_batch = BatchedContextBasedExamples.from_examples([ex])
+            preds = generate_predictions(
+                model, single_batch, encoder_tokenizer, decoder_tokenizer, cfg
+            )
+            predictions.extend(preds)
+
+        all_predictions.extend(predictions)
+        all_miscs.extend(ex.misc for ex in flat_examples)
+
+        num_samples += len(flat_examples)
+        pbar.update(len(flat_examples))
         pbar.set_postfix({"samples": num_samples})
 
     pbar.close()
 
-    # Compute metrics
-    metrics = compute_metrics(all_predictions, all_references)
+    # Print first 5 predictions for debugging
+    for i in range(min(5, len(all_predictions))):
+        gold = all_miscs[i].get("all_answers", ["?"])
+        print(f"[{i}] pred: {all_predictions[i]!r}")
+        print(f"     gold: {gold}")
 
-    # Add task-specific metrics if available
-    if hasattr(task, "compute_metrics"):
-        task_metrics = task.compute_metrics(all_predictions, all_references)
-        metrics.update(task_metrics)
+    if not all_predictions:
+        return {}
 
+    # Use task's evaluate() which knows how to interpret misc
+    metrics = task_cls.evaluate(all_predictions, all_miscs)
+    metrics["num_samples"] = len(all_predictions)
     return metrics
 
 
@@ -331,12 +268,15 @@ def launch_eval(cfg: EvalConfig):
     # Create output directory
     if cfg.eval.dump_dir:
         Path(cfg.eval.dump_dir).mkdir(parents=True, exist_ok=True)
-        dump_config(cfg, Path(cfg.eval.dump_dir) / "config.yaml", log_config=False)
 
     # Load model
     logger.info("Loading model...")
     model, encoder_tokenizer, decoder_tokenizer = load_model_and_tokenizers(cfg)
     logger.info("Model loaded")
+
+    # Import all task modules so they register
+    import addons.tasks.squad  # noqa: F401
+    import addons.tasks.hotpotqa  # noqa: F401
 
     # Run evaluation on each task
     all_results = {}
@@ -346,13 +286,14 @@ def launch_eval(cfg: EvalConfig):
 
         try:
             task = get_task(task_name)
-        except KeyError:
-            logger.warning(f"Task {task_name} not found, skipping")
+            task_cls = task.__class__
+        except ValueError:
+            logger.warning(f"Task {task_name} not found, skipping. Available: {list_tasks()}")
             continue
 
         metrics = evaluate_task(
             model,
-            task,
+            task_cls,
             cfg.eval.split,
             encoder_tokenizer,
             decoder_tokenizer,
@@ -372,13 +313,13 @@ def launch_eval(cfg: EvalConfig):
     # Log to metrics file
     if cfg.eval.metric_log_dir and get_global_rank() == 0:
         metric_log_path = Path(cfg.eval.metric_log_dir) / "metrics.eval.jsonl"
-        timestamp = {
+        log_entry: Dict[str, Any] = {
             "created_at": datetime.utcnow().isoformat(),
+            "results": all_results,
         }
         if cfg.eval.global_step is not None:
-            timestamp["global_step"] = cfg.eval.global_step
+            log_entry["global_step"] = cfg.eval.global_step
 
-        log_entry = timestamp | {"results": all_results}
         with open(metric_log_path, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
 
@@ -387,25 +328,14 @@ def launch_eval(cfg: EvalConfig):
 
 def main():
     """
-    CLI uses OmegaConf for config loading with overrides.
-
     Usage:
-        python -m apps.finesearch.eval config=configs/finesearch/eval.yaml
-        python -m apps.finesearch.eval config=eval.yaml eval.tasks=[squad,hotpotqa]
+        python -m apps.finesearch.eval config=apps/finesearch/configs/debug.yaml \
+            eval.ckpt_dir=outputs/finesearch_debug/checkpoints/step_2000
+        python -m apps.finesearch.eval config=debug.yaml eval.tasks='[squad,hotpotqa]'
     """
-    cli_args = OmegaConf.from_cli()
+    from apps.finesearch.config_utils import load_config
 
-    if not hasattr(cli_args, "config"):
-        print("Usage: python -m apps.finesearch.eval config=<config.yaml> [overrides]")
-        print(f"\nAvailable tasks: {list_tasks()}")
-        sys.exit(1)
-
-    file_cfg = OmegaConf.load(cli_args.config)
-    del cli_args.config
-
-    default_cfg = OmegaConf.structured(EvalConfig())
-    cfg = OmegaConf.merge(default_cfg, file_cfg, cli_args)
-    cfg = OmegaConf.to_object(cfg)
+    cfg = load_config(EvalConfig)
 
     results = launch_eval(cfg)
 

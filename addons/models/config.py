@@ -19,6 +19,7 @@ class ModelArgs:
     freeze_encoder: bool = False
 
     # Encoder local attention (hybrid local/global)
+    # See addons/models/attention.py for mask implementations
     enc_local_layer_ratio: float = 0.0  # Fraction of bottom layers with local attention
     enc_local_mask_type: Literal["segment", "block_causal"] = "segment"
 
@@ -28,12 +29,14 @@ class ModelArgs:
     num_decoder_layers: int = 6  # Only used when decoder_name is empty
 
     # Cross-attention (ignored in decoder-only mode)
-    # Available types: "softmax", "linear", "gla", "delta_rule", "gated_delta_rule",
-    #                  "kda", "retention", "based", "simple_gla", "mamba2", "rwkv6",
-    #                  "hgrn2", "abc"
+    # See addons/models/attention.py for kernel implementations
     cross_attn_layers: str = "all"  # "all" or comma-separated layer indices
     cross_attn_heads: int = 8
-    cross_attn_type: str = "softmax"
+    cross_attn_type: Literal[
+        "softmax", "linear", "gla", "delta_rule", "gated_delta_rule",
+        "kda", "retention", "based", "simple_gla", "mamba2", "rwkv6",
+        "hgrn2", "abc",
+    ] = "softmax"
 
 
 @dataclass

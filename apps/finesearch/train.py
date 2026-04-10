@@ -4,25 +4,22 @@ Training script for FineSearch encoder-decoder.
 Usage:
     python -m apps.finesearch.train config=configs/finesearch/train.yaml
 
-Uses OmegaConf for YAML config with CLI overrides (same pattern as apps/main).
+Uses YAML config with CLI overrides.
 """
 
 import gc
 import logging
 import os
 import sys
-import types
 import dataclasses
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from timeit import default_timer as timer
-from typing import Any, Dict, List, Optional, Type, TypeVar, get_type_hints
+from typing import Any, Dict, List, Optional
 
-import yaml
 import torch
 import torch.distributed as dist
-from omegaconf import OmegaConf
 from tqdm import tqdm
 from lingua.checkpoint import CheckpointArgs, CheckpointManager
 from lingua.distributed import (
@@ -67,6 +64,8 @@ class DataArgs:
     batch_size: int = 32  # Examples per reader fetch
     packer_buffer_size: int = 50
     seed: int = 42
+    enc_token_cost: float = 1.0  # Encoder token weight for packing budget
+    dec_token_cost: float = 1.0  # Decoder token weight (higher = fewer decoder tokens per batch)
 
     # Fallback decoder tokenizer (used when model.decoder_name is empty)
     default_decoder_tokenizer: str = "meta-llama/Llama-3.2-1B"
@@ -165,6 +164,8 @@ def build_data_pipeline(args: DataArgs, split: str = "train"):
         batch_size=args.batch_size,
         packer_buffer_size=args.packer_buffer_size,
         seed=args.seed,
+        enc_token_cost=args.enc_token_cost,
+        dec_token_cost=args.dec_token_cost,
     )
 
     pipeline = create_pipeline_from_names(
@@ -240,7 +241,8 @@ def train(cfg: TrainConfig):
         # Setup distributed
         if get_is_master():
             os.makedirs(cfg.dump_dir, exist_ok=True)
-            _dump_config_yaml(cfg, Path(cfg.dump_dir) / "config.yaml")
+            from apps.finesearch.config_utils import dump_yaml
+            dump_yaml(cfg, Path(cfg.dump_dir) / "config.yaml")
 
         init_logger(Path(cfg.dump_dir) / "train.log")
         init_signal_handler(set_preemption_flag)
@@ -299,9 +301,7 @@ def train(cfg: TrainConfig):
         # Checkpoint manager
         checkpoint = CheckpointManager.instantiate_and_make_dir(cfg.checkpoint)
 
-        # Convert config to OmegaConf-safe dict for checkpointing
-        # (Literal type annotations not supported by OmegaConf.structured)
-        cfg_dict = OmegaConf.create(dataclasses.asdict(cfg))
+        cfg_dict = dataclasses.asdict(cfg)
 
         # Metric logger
         metric_logger = context_stack.enter_context(
@@ -321,6 +321,9 @@ def train(cfg: TrainConfig):
         total_loss = 0.0
         time_last_log = timer()
         tokens_since_log = 0
+        total_examples = 0
+        total_enc_tokens = 0
+        total_dec_tokens = 0
 
         model.train()
         logger.info("Starting training")
@@ -349,6 +352,11 @@ def train(cfg: TrainConfig):
                     device,
                 )
                 batch = next(train_iter)
+
+            # Track data stats
+            total_examples += batch.batch_size
+            total_enc_tokens += batch.encoder_tokens.tokens.numel()
+            total_dec_tokens += batch.decoder_tokens.tokens.numel()
 
             # Forward pass
             optimizer.zero_grad()
@@ -386,16 +394,25 @@ def train(cfg: TrainConfig):
                     avg_loss = total_loss / cfg.log_interval
                     tps = tokens_since_log / time_delta
 
-                    gpu_stats = gpu_memory_monitor.get_peak_stats()
+                    grad_norm_val = grad_norm.item() if hasattr(grad_norm, "item") else grad_norm
 
                     metrics = {
-                        "step": step,
+                        "global_step": step,
                         "loss": avg_loss,
-                        "grad_norm": grad_norm.item() if hasattr(grad_norm, "item") else grad_norm,
+                        "grad_norm": grad_norm_val,
                         "lr": optimizer.param_groups[0]["lr"],
                         "tokens_per_sec": tps,
-                        "gpu_mem_pct": gpu_stats.max_active_pct,
+                        "total_examples": total_examples,
+                        "total_enc_tokens": total_enc_tokens,
+                        "total_dec_tokens": total_dec_tokens,
+                        "total_tokens": total_enc_tokens + total_dec_tokens,
                     }
+
+                    # Pipeline stats (per-source example counts)
+                    pipeline_stats = ray.get(train_pipeline.get_stats.remote())
+                    metrics["packer_buffer_size"] = pipeline_stats["buffer_size"]
+                    for source, count in pipeline_stats["source_counts"].items():
+                        metrics[f"examples/{source}"] = count
 
                     if get_is_master():
                         metric_logger.log(metrics)
@@ -403,10 +420,8 @@ def train(cfg: TrainConfig):
                     logger.info(
                         f"step: {step:>6}  "
                         f"loss: {avg_loss:.4f}  "
-                        f"grad: {metrics['grad_norm']:.2e}  "
                         f"lr: {metrics['lr']:.2e}  "
-                        f"tps: {tps:.0f}  "
-                        f"mem: {gpu_stats.max_active_pct:.0f}%"
+                        f"tps: {tps:.0f}"
                     )
 
                     pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
@@ -414,7 +429,6 @@ def train(cfg: TrainConfig):
                     total_loss = 0.0
                     tokens_since_log = 0
                     time_last_log = timer()
-                    gpu_memory_monitor.reset_peak_stats()
 
                 # Checkpointing
                 saved = False
@@ -459,7 +473,7 @@ def train(cfg: TrainConfig):
                         val_loss /= val_batches
                         logger.info(f"Validation loss: {val_loss:.4f}")
                         if get_is_master():
-                            metric_logger.log({"step": step, "val_loss": val_loss})
+                            metric_logger.log({"global_step": step, "val_loss": val_loss})
 
                     model.train()
 
@@ -476,82 +490,22 @@ def train(cfg: TrainConfig):
         checkpoint.save(model, optimizer, TrainState(step=step), cfg_dict)
         logger.info(f"Training complete. Final step: {step}")
 
+    if dist.is_initialized():
+        dist.barrier()
+    if ray.is_initialized():
+        ray.shutdown()
     gc.collect()
-
-
-T = TypeVar("T")
-
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge override into base."""
-    result = base.copy()
-    for k, v in override.items():
-        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
-            result[k] = _deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
-
-
-def _dataclass_defaults(cls) -> dict:
-    """Extract defaults from a dataclass, recursing into nested dataclasses."""
-    result = {}
-    for f in dataclasses.fields(cls):
-        if dataclasses.is_dataclass(f.type):
-            result[f.name] = _dataclass_defaults(f.type)
-        elif f.default is not dataclasses.MISSING:
-            result[f.name] = f.default
-        elif f.default_factory is not dataclasses.MISSING:
-            result[f.name] = f.default_factory()
-    return result
-
-
-def _dict_to_dataclass(cls: Type[T], data: dict) -> T:
-    """Convert a dict to a dataclass, recursing into nested dataclasses."""
-    kwargs = {}
-    field_types = {f.name: f.type for f in dataclasses.fields(cls)}
-    for k, v in data.items():
-        ft = field_types.get(k)
-        if ft and dataclasses.is_dataclass(ft) and isinstance(v, dict):
-            kwargs[k] = _dict_to_dataclass(ft, v)
-        else:
-            kwargs[k] = v
-    return cls(**kwargs)
-
-
-def _dump_config_yaml(cfg, path):
-    """Dump dataclass config to YAML without OmegaConf.structured()."""
-    d = dataclasses.asdict(cfg) if dataclasses.is_dataclass(cfg) else cfg
-    yaml_str = yaml.dump(d, default_flow_style=False, sort_keys=False)
-    logger.info("Using the following config for this run:")
-    logger.info(yaml_str)
-    with open(path, "w") as f:
-        f.write(yaml_str)
 
 
 def main():
     """
-    CLI uses OmegaConf only for YAML loading and CLI parsing (no structured()).
-
     Usage:
         python -m apps.finesearch.train config=apps/finesearch/configs/debug.yaml
         python -m apps.finesearch.train config=debug.yaml model.encoder_name=bert-base
     """
-    cli_args = OmegaConf.from_cli()
+    from apps.finesearch.config_utils import load_config
 
-    if not hasattr(cli_args, "config"):
-        print("Usage: python -m apps.finesearch.train config=<config.yaml> [overrides]")
-        sys.exit(1)
-
-    file_cfg = OmegaConf.to_container(OmegaConf.load(cli_args.config), resolve=True)
-    del cli_args.config
-    cli_overrides = OmegaConf.to_container(cli_args, resolve=True)
-
-    defaults = _dataclass_defaults(TrainConfig)
-    merged = _deep_merge(defaults, file_cfg)
-    merged = _deep_merge(merged, cli_overrides)
-
-    cfg = _dict_to_dataclass(TrainConfig, merged)
+    cfg = load_config(TrainConfig)
     train(cfg)
 
 

@@ -17,7 +17,7 @@ dependencies = [
     "viztracer",
     "lm-eval",
     "scipy",
-    "pynvml",
+    "nvidia-ml-py",
     "datatrove",
     "orjson",
     "torch==2.7.0",

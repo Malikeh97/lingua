@@ -246,6 +246,8 @@ class PipelineConfig:
     batch_size: int = 64  # examples per reader fetch
     packer_buffer_size: int = 50
     seed: int = 42
+    enc_token_cost: float = 1.0
+    dec_token_cost: float = 1.0
 
 
 @dataclass
@@ -345,7 +347,10 @@ class PipelineCoordinator:
             # Record sample and add to packer
             ray.get(self.mixer.record_sample.remote(source))
             for unit in units:
-                token_count = unit.estimate_tokens()
+                token_count = unit.estimate_tokens(
+                    enc_cost=self.config.enc_token_cost,
+                    dec_cost=self.config.dec_token_cost,
+                )
                 ray.get(self.packer.add.remote(unit, token_count))
 
     def get_batch_async(self) -> ray.ObjectRef:

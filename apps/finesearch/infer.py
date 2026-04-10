@@ -18,12 +18,11 @@ from pathlib import Path
 from typing import List, Optional
 
 import torch
-from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from transformers import AutoTokenizer
 
-from lingua.args import dataclass_from_dict
+from apps.finesearch.config_utils import dict_to_dataclass
 from lingua.checkpoint import CONSOLIDATE_FOLDER, consolidate_checkpoints
 
 from addons.models.config import ModelArgs, GenerationArgs
@@ -85,9 +84,11 @@ def load_model_and_tokenizers(cfg: InferConfig):
     # Load training config to infer model args
     params_path = consolidate_path / "params.json"
     if params_path.exists():
-        train_cfg = OmegaConf.load(params_path)
-        if hasattr(train_cfg, "model"):
-            cfg.model = dataclass_from_dict(ModelArgs, train_cfg.model, strict=False)
+        import json as _json
+        with open(params_path) as _f:
+            train_params = _json.load(_f)
+        if "model" in train_params and isinstance(train_params["model"], dict):
+            cfg.model = dict_to_dataclass(ModelArgs, train_params["model"])
 
     # Build model
     if cfg.model.model_type == "encdec":
@@ -404,28 +405,13 @@ def run_batch(engine: FineSearchEngine, cfg: InferConfig):
 
 def main():
     """
-    CLI uses OmegaConf for config loading with overrides.
-
     Usage:
         python -m apps.finesearch.infer config=configs/finesearch/infer.yaml
         python -m apps.finesearch.infer config=infer.yaml infer.mode=batch infer.input_file=data.jsonl
     """
-    cli_args = OmegaConf.from_cli()
+    from apps.finesearch.config_utils import load_config
 
-    # Allow running without config file in interactive mode
-    if not hasattr(cli_args, "config"):
-        print("Usage: python -m apps.finesearch.infer config=<config.yaml> [overrides]")
-        print("\nModes:")
-        print("  infer.mode=interactive  - Chat-like interface")
-        print("  infer.mode=batch        - Process file")
-        sys.exit(1)
-
-    file_cfg = OmegaConf.load(cli_args.config)
-    del cli_args.config
-
-    default_cfg = OmegaConf.structured(InferConfig())
-    cfg = OmegaConf.merge(default_cfg, file_cfg, cli_args)
-    cfg = OmegaConf.to_object(cfg)
+    cfg = load_config(InferConfig)
 
     # Load model
     print("Loading model...")

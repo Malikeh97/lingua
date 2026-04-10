@@ -1,0 +1,14 @@
+# Eval config for debug run
+# Inherits model from debug.yaml
+
+eval:
+  tasks:
+    - squad
+  split: validation
+  batch_size: 8
+  ckpt_dir: ""  # override via CLI
+
+generation:
+  max_new_tokens: 64
+  temperature: 1.0
+  do_sample: false
