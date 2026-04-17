@@ -38,14 +38,14 @@ from lingua.metrics import GPUMemoryMonitor, LoggingArgs, MetricLogger, get_num_
 from lingua.optim import OptimArgs, build_optimizer
 from lingua.profiling import ProfilerArgs, maybe_run_profiler
 
-from transformers import AutoTokenizer
+
 import ray
 
 from addons.models.config import ModelArgs
 from addons.models.encoder_decoder import EncoderDecoder
 from addons.models.decoder import Decoder
-from addons.data.collate import TokenizedBatch, PackedSequences
-from addons.data.ray_pipeline import PipelineConfig, create_pipeline_from_names
+from addons.data.collate import TokenizedBatch
+from addons.data.ray_pipeline import PipelineConfig, create_pipeline
 from addons.trainer import Trainer, TrainerArgs
 
 logger = logging.getLogger()
@@ -54,21 +54,7 @@ logger = logging.getLogger()
 # ==================== Configuration ====================
 
 
-@dataclass
-class DataArgs:
-    """Data pipeline configuration."""
-
-    tasks: List[str] = field(default_factory=lambda: ["squad"])
-    weights: List[float] = field(default_factory=lambda: [1.0])
-    target_tokens: int = 65536
-    batch_size: int = 32  # Examples per reader fetch
-    packer_buffer_size: int = 50
-    seed: int = 42
-    enc_token_cost: float = 1.0  # Encoder token weight for packing budget
-    dec_token_cost: float = 1.0  # Decoder token weight (higher = fewer decoder tokens per batch)
-
-    # Fallback decoder tokenizer (used when model.decoder_name is empty)
-    default_decoder_tokenizer: str = "meta-llama/Llama-3.2-1B"
+from addons.data.config import DataArgs
 
 
 @dataclass
@@ -97,8 +83,8 @@ class TrainConfig:
     profiling: ProfilerArgs = field(default_factory=ProfilerArgs)
     logging: LoggingArgs = field(default_factory=LoggingArgs)
 
-    # Evaluation during training
-    eval: Optional[Any] = None
+    # Validation during training
+    run_val: bool = True
 
 
 # ==================== Signal Handler ====================
@@ -136,25 +122,43 @@ def build_model(args: ModelArgs) -> torch.nn.Module:
     return model
 
 
-def build_tokenizers(model_args: ModelArgs, data_args: DataArgs):
-    """Build encoder and decoder tokenizers from model args."""
-    # Encoder tokenizer from model.encoder_name
-    encoder_tokenizer = AutoTokenizer.from_pretrained(model_args.encoder_name)
-
-    # Decoder tokenizer: use pretrained decoder's tokenizer if available,
-    # otherwise reuse encoder tokenizer (from-scratch decoder shares encoder embeddings)
-    if model_args.decoder_name:
-        decoder_tokenizer = AutoTokenizer.from_pretrained(model_args.decoder_name)
-    else:
-        decoder_tokenizer = encoder_tokenizer
-
-    return encoder_tokenizer, decoder_tokenizer
-
-
 # ==================== Data Pipeline ====================
 
 
-def build_data_pipeline(args: DataArgs, split: str = "train"):
+def build_val_pipeline(args: DataArgs, tokenizer_factory):
+    """Build validation pipeline using only tasks that have a validation split."""
+    from addons.tasks.registry import get_task
+
+    val_sources = []
+    for source in args.sources:
+        source = dict(source)
+        name = source["task"]
+        task_cls = get_task(name).__class__
+        try:
+            data = task_cls.prepare_data("validation", **{k: v for k, v in source.items() if k not in ("task", "weight")})
+            del data
+            val_sources.append(source)
+        except Exception:
+            logger.info(f"Task '{name}' has no validation split, skipping for validation")
+
+    if not val_sources:
+        return None
+
+    val_args = DataArgs(
+        sources=val_sources,
+        target_tokens=args.target_tokens,
+        batch_size=args.batch_size,
+        packer_buffer_size=args.packer_buffer_size,
+        seed=args.seed,
+        doc_max_tokens=args.doc_max_tokens,
+        target_max_tokens=args.target_max_tokens,
+        enc_token_cost=args.enc_token_cost,
+        dec_token_cost=args.dec_token_cost,
+    )
+    return build_data_pipeline(val_args, split="validation", tokenizer_factory=tokenizer_factory)
+
+
+def build_data_pipeline(args: DataArgs, split: str = "train", tokenizer_factory=None):
     """Build Ray data pipeline."""
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
@@ -168,33 +172,37 @@ def build_data_pipeline(args: DataArgs, split: str = "train"):
         dec_token_cost=args.dec_token_cost,
     )
 
-    pipeline = create_pipeline_from_names(
-        task_names=args.tasks,
-        weights=args.weights,
+    # Build task configs and weights from sources
+    task_configs = {}
+    weight_dict = {}
+    for source in args.sources:
+        source = dict(source)  # copy
+        name = source.pop("task")
+        weight = source.pop("weight", 1.0)
+        task_configs[name] = {"task_name": name, **source}
+        weight_dict[name] = weight
+
+    pipeline = create_pipeline(
+        task_configs=task_configs,
+        weights=weight_dict,
         config=config,
         split=split,
+        tokenizer_factory=tokenizer_factory,
+        doc_max_tokens=args.doc_max_tokens,
+        target_max_tokens=args.target_max_tokens,
     )
 
     return pipeline
 
 
 class DataIterator:
-    """Wraps Ray pipeline for training iteration."""
+    """Wraps Ray pipeline for training iteration.
 
-    def __init__(
-        self,
-        pipeline,
-        encoder_tokenizer,
-        decoder_tokenizer,
-        encoder_max_len: int,
-        decoder_max_len: int,
-        device: torch.device,
-    ):
+    Pipeline returns TokenizedBatch on CPU. Iterator moves it to device.
+    """
+
+    def __init__(self, pipeline, device: torch.device):
         self.pipeline = pipeline
-        self.encoder_tokenizer = encoder_tokenizer
-        self.decoder_tokenizer = decoder_tokenizer
-        self.encoder_max_len = encoder_max_len
-        self.decoder_max_len = decoder_max_len
         self.device = device
 
     def __iter__(self):
@@ -204,17 +212,7 @@ class DataIterator:
         batch = ray.get(self.pipeline.get_batch.remote())
         if batch is None:
             raise StopIteration
-
-        # Tokenize batch
-        tokenized = TokenizedBatch.from_batched_examples(
-            batch,
-            self.encoder_tokenizer,
-            self.decoder_tokenizer,
-            self.encoder_max_len,
-            self.decoder_max_len,
-            self.device,
-        )
-        return tokenized
+        return batch.to(self.device)
 
 
 # ==================== Training Loop ====================
@@ -227,10 +225,10 @@ def validate_config(cfg: TrainConfig):
     if cfg.checkpoint.path is None:
         cfg.checkpoint.path = str(Path(cfg.dump_dir) / "checkpoints")
 
-    # Validate task/weight lengths
-    assert len(cfg.data.tasks) == len(cfg.data.weights), (
-        f"tasks ({len(cfg.data.tasks)}) and weights ({len(cfg.data.weights)}) must match"
-    )
+    # Validate sources
+    assert cfg.data.sources, "data.sources must not be empty"
+    for i, src in enumerate(cfg.data.sources):
+        assert "task" in src, f"data.sources[{i}] must have 'task' key"
 
 
 def train(cfg: TrainConfig):
@@ -254,9 +252,10 @@ def train(cfg: TrainConfig):
         # Set seed
         torch.manual_seed(cfg.seed)
 
-        # Build tokenizers
+        # Build tokenizer factory (model owns the special token logic)
         logger.info("Building tokenizers")
-        encoder_tokenizer, decoder_tokenizer = build_tokenizers(cfg.model, cfg.data)
+        model_cls = EncoderDecoder if cfg.model.model_type == "encdec" else Decoder
+        tokenizer_factory = model_cls.tokenizer_factory(cfg.model)
 
         # Build model
         logger.info("Building model")
@@ -266,6 +265,12 @@ def train(cfg: TrainConfig):
         dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
         model_dtype = dtype_map.get(cfg.distributed.model_dtype, torch.float32)
         model = model.to(device=cfg.trainer.device, dtype=model_dtype)
+
+        # Activation checkpointing
+        if cfg.model.activation_checkpointing:
+            from addons.models.encoder_decoder import apply_activation_checkpointing
+            logger.info("Enabling activation checkpointing on decoder layers")
+            apply_activation_checkpointing(model)
 
         model_param_count = get_num_params(model)
         logger.info(f"Model size: {model_param_count:,} parameters")
@@ -282,21 +287,16 @@ def train(cfg: TrainConfig):
 
         # Build data pipeline
         logger.info("Building data pipeline")
-        train_pipeline = build_data_pipeline(cfg.data, split="train")
+        train_pipeline = build_data_pipeline(cfg.data, split="train", tokenizer_factory=tokenizer_factory)
         val_pipeline = None
-        if cfg.eval_interval > 0:
-            val_pipeline = build_data_pipeline(cfg.data, split="validation")
+        if cfg.run_val and cfg.eval_interval > 0:
+            val_pipeline = build_val_pipeline(cfg.data, tokenizer_factory=tokenizer_factory)
+            if val_pipeline is None:
+                logger.warning("No tasks with validation split found, disabling validation")
 
-        # Create data iterators
+        # Create data iterator
         device = torch.device(cfg.trainer.device)
-        train_iter = DataIterator(
-            train_pipeline,
-            encoder_tokenizer,
-            decoder_tokenizer,
-            cfg.model.encoder_max_len,
-            cfg.model.decoder_max_len,
-            device,
-        )
+        train_iter = DataIterator(train_pipeline, device)
 
         # Checkpoint manager
         checkpoint = CheckpointManager.instantiate_and_make_dir(cfg.checkpoint)
@@ -343,14 +343,7 @@ def train(cfg: TrainConfig):
                 batch = next(train_iter)
             except StopIteration:
                 # Reset iterator
-                train_iter = DataIterator(
-                    train_pipeline,
-                    encoder_tokenizer,
-                    decoder_tokenizer,
-                    cfg.model.encoder_max_len,
-                    cfg.model.decoder_max_len,
-                    device,
-                )
+                train_iter = DataIterator(train_pipeline, device)
                 batch = next(train_iter)
 
             # Track data stats
@@ -436,20 +429,13 @@ def train(cfg: TrainConfig):
                     saved = checkpoint.save(model, optimizer, TrainState(step=step), cfg_dict)
 
                 # Evaluation
-                if cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
+                if val_pipeline is not None and cfg.eval_interval > 0 and step % cfg.eval_interval == 0:
                     logger.info("Running evaluation...")
                     model.eval()
                     val_loss = 0.0
                     val_batches = 0
 
-                    val_iter = DataIterator(
-                        val_pipeline,
-                        encoder_tokenizer,
-                        decoder_tokenizer,
-                        cfg.model.encoder_max_len,
-                        cfg.model.decoder_max_len,
-                        device,
-                    )
+                    val_iter = DataIterator(val_pipeline, device)
 
                     with torch.no_grad():
                         for _ in range(100):  # Max 100 val batches

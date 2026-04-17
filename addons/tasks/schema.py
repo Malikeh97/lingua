@@ -1,12 +1,12 @@
 """
 Data schema for context-based examples.
-
-Framework-agnostic - pure Python dataclasses.
 """
 
 import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
+
+import torch
 
 
 @dataclass
@@ -15,6 +15,7 @@ class ContextBasedExample:
     Single example with document pool.
 
     Documents are stored by hash for deduplication when batching.
+    Tokenized fields are populated by the reader via .tokenize().
     """
 
     # Document pool: sha256 hash -> document text
@@ -32,6 +33,11 @@ class ContextBasedExample:
     # Optional
     instruction: Optional[str] = None
     misc: Dict[str, Any] = field(default_factory=dict)
+
+    # Tokenized fields (populated by .tokenize(), required by packer)
+    doc_token_ids: Optional[Dict[str, torch.Tensor]] = None  # hash → [doc_len]
+    dec_token_ids: Optional[torch.Tensor] = None  # [dec_len] with BOS/EOS
+    tok_labels: Optional[torch.Tensor] = None  # [dec_len], -100 for prompt
 
     @staticmethod
     def _hash_doc(doc: str) -> str:
@@ -71,25 +77,69 @@ class ContextBasedExample:
         """Retrieve documents in order."""
         return [self.documents[h] for h in self.document_hashes]
 
-    def estimate_tokens(
+    def tokenize(
         self,
-        chars_per_token: float = 4.0,
-        enc_cost: float = 1.0,
-        dec_cost: float = 1.0,
-    ) -> int:
-        """
-        Estimate weighted token cost for bin-packing.
+        encoder_tokenizer,
+        decoder_tokenizer,
+        doc_max_tokens: int,
+        target_max_tokens: int,
+    ) -> "ContextBasedExample":
+        """Tokenize documents and decoder sequence in-place.
 
-        Encoder tokens (documents) weighted by enc_cost,
-        decoder tokens (query + target) weighted by dec_cost.
+        Encoder: each document tokenized separately, truncated to doc_max_tokens.
+        Decoder: [BOS] query target [EOS], truncated to target_max_tokens.
         """
-        enc_chars = sum(len(d) for d in self.documents.values())
-        dec_chars = len(self.query) + len(self.target_text)
-        if self.instruction:
-            dec_chars += len(self.instruction)
-        enc_tokens = enc_chars / chars_per_token
-        dec_tokens = dec_chars / chars_per_token
-        return int(enc_tokens * enc_cost + dec_tokens * dec_cost)
+        # Tokenize each document by hash (dedup-friendly)
+        self.doc_token_ids = {}
+        for doc_hash, doc_text in self.documents.items():
+            enc = encoder_tokenizer(
+                doc_text,
+                max_length=doc_max_tokens,
+                truncation=True,
+                return_tensors="pt",
+                add_special_tokens=True,
+            )
+            self.doc_token_ids[doc_hash] = enc["input_ids"].squeeze(0)
+
+        # Decoder: [BOS] query target [EOS]
+        bos_id = decoder_tokenizer.cls_token_id or decoder_tokenizer.bos_token_id
+        eos_id = decoder_tokenizer.sep_token_id or decoder_tokenizer.eos_token_id
+
+        query_ids = decoder_tokenizer(
+            self.query, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"].squeeze(0)
+        target_ids = decoder_tokenizer(
+            self.target_text, add_special_tokens=False, return_tensors="pt"
+        )["input_ids"].squeeze(0)
+
+        parts = []
+        if bos_id is not None:
+            parts.append(torch.tensor([bos_id]))
+        parts.append(query_ids)
+        prompt_len = sum(p.shape[0] for p in parts)
+        parts.append(target_ids)
+        if eos_id is not None:
+            parts.append(torch.tensor([eos_id]))
+
+        self.dec_token_ids = torch.cat(parts, dim=0)[:target_max_tokens]
+        self.tok_labels = self.dec_token_ids.clone()
+        self.tok_labels[:min(prompt_len, target_max_tokens)] = -100
+
+        return self
+
+    @property
+    def enc_tokens(self) -> int:
+        """Exact encoder token count. Requires .tokenize() first."""
+        return sum(t.shape[0] for t in self.doc_token_ids.values())
+
+    @property
+    def dec_tokens(self) -> int:
+        """Exact decoder token count. Requires .tokenize() first."""
+        return self.dec_token_ids.shape[0]
+
+    def token_cost(self, enc_cost: float = 1.0, dec_cost: float = 1.0) -> int:
+        """Exact weighted token count for packing."""
+        return int(self.enc_tokens * enc_cost + self.dec_tokens * dec_cost)
 
 
 @dataclass
@@ -130,7 +180,6 @@ class BatchedContextBasedExamples:
         if misc is None:
             misc = [{} for _ in range(n)]
 
-        # Build deduplicated document pool
         doc_dict: Dict[str, str] = {}
         all_hashes: List[List[str]] = []
 
@@ -158,7 +207,6 @@ class BatchedContextBasedExamples:
         cls, examples: List[ContextBasedExample]
     ) -> "BatchedContextBasedExamples":
         """Collate examples, merging document dicts for deduplication."""
-        # Merge all document pools
         merged_docs: Dict[str, str] = {}
         for ex in examples:
             merged_docs.update(ex.documents)
@@ -183,7 +231,6 @@ class BatchedContextBasedExamples:
 
     def __getitem__(self, idx: int) -> ContextBasedExample:
         """Get a single example from the batch."""
-        # Extract only the documents needed for this example
         ex_doc_hashes = self.document_hashes[idx]
         ex_docs = {h: self.documents[h] for h in ex_doc_hashes}
 
@@ -201,23 +248,3 @@ class BatchedContextBasedExamples:
     def __iter__(self) -> Iterator[ContextBasedExample]:
         for i in range(len(self)):
             yield self[i]
-
-    def estimate_tokens(
-        self,
-        chars_per_token: float = 4.0,
-        enc_cost: float = 1.0,
-        dec_cost: float = 1.0,
-    ) -> int:
-        """
-        Estimate weighted token cost for bin-packing.
-
-        Encoder tokens (documents) weighted by enc_cost,
-        decoder tokens (queries + targets) weighted by dec_cost.
-        """
-        enc_chars = sum(len(d) for d in self.documents.values())
-        dec_chars = sum(len(q) for q in self.queries)
-        dec_chars += sum(len(t) for t in self.target_texts)
-        dec_chars += sum(len(i) for i in self.instructions if i)
-        enc_tokens = enc_chars / chars_per_token
-        dec_tokens = dec_chars / chars_per_token
-        return int(enc_tokens * enc_cost + dec_tokens * dec_cost)

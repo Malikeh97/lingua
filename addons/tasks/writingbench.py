@@ -40,67 +40,42 @@ class WritingBenchTask(BaseTask):
         return ["rouge1", "rouge2", "rougeL", "rougeLsum"]
 
     @classmethod
-    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
-        """
-        Initialize reading state.
-
-        Args:
-            split: Data split
-            **kwargs:
-                dataset_path: HuggingFace dataset path (default: "writingbench/WritingBench")
-                max_examples: Optional cap on examples
-                shuffle: Whether to shuffle (default True for train)
-                seed: Random seed for shuffling
-        """
+    def prepare_data(cls, split: str = "train", **kwargs):
         dataset_path = kwargs.get("dataset_path", "writingbench/WritingBench")
-
         try:
             dataset = load_dataset(dataset_path, split=split)
         except Exception:
-            # Fallback: create empty dataset if not available
             raise ValueError(
                 f"WritingBench dataset not found at {dataset_path}. "
                 "Please provide a valid dataset_path."
             )
-
-        # Optional shuffle
         shuffle = kwargs.get("shuffle", split == "train")
         seed = kwargs.get("seed", 42)
         if shuffle:
             dataset = dataset.shuffle(seed=seed)
-
-        # Optional limit
         max_examples = kwargs.get("max_examples")
         if max_examples is not None:
             dataset = dataset.select(range(min(max_examples, len(dataset))))
+        return dataset
 
-        return {
-            "dataset": dataset,
-            "idx": 0,
-            "exhausted": False,
-        }
+    @classmethod
+    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
+        return {"idx": 0, "exhausted": False}
 
     @classmethod
     def read(
-        cls, state: Dict[str, Any], batch_size: int
+        cls, data, state: Dict[str, Any], batch_size: int
     ) -> Tuple[
         List[Union[ContextBasedExample, BatchedContextBasedExamples]], Dict[str, Any]
     ]:
-        """Read batch_size examples."""
-        dataset = state["dataset"]
         idx = state["idx"]
         examples = []
-
-        end_idx = min(idx + batch_size, len(dataset))
+        end_idx = min(idx + batch_size, len(data))
         for i in range(idx, end_idx):
-            raw = dataset[i]
+            raw = data[i]
             ex = cls._map_example(raw)
             examples.append(ex)
-
-        new_state = {
-            **state,
-            "idx": end_idx,
-            "exhausted": end_idx >= len(dataset),
+        new_state = {**state, "idx": end_idx, "exhausted": end_idx >= len(data),
         }
         return examples, new_state
 

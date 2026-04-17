@@ -1,7 +1,5 @@
 """
 Collation utilities for packed sequences.
-
-Framework-agnostic - pure PyTorch, no distributed imports.
 """
 
 import os
@@ -13,7 +11,7 @@ import torch
 _DEBUG = os.environ.get("DEBUG") == "1"
 _debug_printed = False
 
-from addons.tasks.schema import BatchedContextBasedExamples
+from addons.tasks.schema import BatchedContextBasedExamples, ContextBasedExample
 
 
 @dataclass
@@ -93,8 +91,8 @@ class TokenizedBatch:
         batch: BatchedContextBasedExamples,
         encoder_tokenizer: Any,
         decoder_tokenizer: Any,
-        encoder_max_len: int,
-        decoder_max_len: int,
+        doc_max_tokens: int,
+        target_max_tokens: int,
         device: torch.device,
     ) -> "TokenizedBatch":
         """
@@ -114,7 +112,7 @@ class TokenizedBatch:
             doc_hash_to_idx[doc_hash] = len(doc_tensors)
             enc = encoder_tokenizer(
                 doc_text,
-                max_length=encoder_max_len,
+                max_length=doc_max_tokens,
                 truncation=True,
                 return_tensors="pt",
                 add_special_tokens=True,
@@ -160,10 +158,10 @@ class TokenizedBatch:
             if eos_id is not None:
                 parts.append(torch.tensor([eos_id]))
 
-            full_ids = torch.cat(parts, dim=0)[:decoder_max_len]
+            full_ids = torch.cat(parts, dim=0)[:target_max_tokens]
 
             # Labels: -100 for prompt (BOS + query), predict target + EOS
-            query_len = min(prompt_len, decoder_max_len)
+            query_len = min(prompt_len, target_max_tokens)
             labels = full_ids.clone()
             labels[:query_len] = -100
 
@@ -233,5 +231,67 @@ class TokenizedBatch:
             doc_hash_to_idx=self.doc_hash_to_idx,
             decoder_tokens=PackedSequences.from_tensors(prompt_tensors, device),
             labels=torch.tensor([], device=device),  # no labels at generation
+            example_doc_indices=self.example_doc_indices,
+        )
+
+    @classmethod
+    def from_tokenized_examples(
+        cls,
+        examples: List["ContextBasedExample"],
+        device: torch.device = torch.device("cpu"),
+    ) -> "TokenizedBatch":
+        """
+        Build TokenizedBatch from pre-tokenized ContextBasedExamples.
+
+        Deduplicates documents by hash, packs encoder/decoder tokens.
+        """
+        # Deduplicate documents across all examples
+        doc_hash_to_idx: Dict[str, int] = {}
+        doc_tensors: List[torch.Tensor] = []
+
+        for ex in examples:
+            for doc_hash in ex.document_hashes:
+                if doc_hash not in doc_hash_to_idx:
+                    doc_hash_to_idx[doc_hash] = len(doc_tensors)
+                    doc_tensors.append(ex.doc_token_ids[doc_hash])
+
+        encoder_tokens = PackedSequences.from_tensors(doc_tensors, device)
+
+        # Pack decoder tokens and labels
+        dec_tensors = [ex.dec_token_ids for ex in examples]
+        label_tensors = [ex.tok_labels for ex in examples]
+
+        decoder_tokens = PackedSequences.from_tensors(dec_tensors, device)
+        all_labels = torch.cat(label_tensors, dim=0).to(device)
+
+        # Build doc index mapping per example
+        example_doc_indices = [
+            [doc_hash_to_idx[h] for h in ex.document_hashes]
+            for ex in examples
+        ]
+
+        return cls(
+            encoder_tokens=encoder_tokens,
+            doc_hash_to_idx=doc_hash_to_idx,
+            decoder_tokens=decoder_tokens,
+            labels=all_labels,
+            example_doc_indices=example_doc_indices,
+        )
+
+    def to(self, device: torch.device) -> "TokenizedBatch":
+        """Move all tensors to device."""
+        return TokenizedBatch(
+            encoder_tokens=PackedSequences(
+                tokens=self.encoder_tokens.tokens.to(device),
+                cu_seqlens=self.encoder_tokens.cu_seqlens.to(device),
+                lengths=self.encoder_tokens.lengths,
+            ),
+            doc_hash_to_idx=self.doc_hash_to_idx,
+            decoder_tokens=PackedSequences(
+                tokens=self.decoder_tokens.tokens.to(device),
+                cu_seqlens=self.decoder_tokens.cu_seqlens.to(device),
+                lengths=self.decoder_tokens.lengths,
+            ),
+            labels=self.labels.to(device),
             example_doc_indices=self.example_doc_indices,
         )

@@ -136,6 +136,7 @@ class SoftmaxAttention(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         sp_group: Optional[dist.ProcessGroup] = None,
         causal: bool = False,
+        freq_cis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -147,12 +148,19 @@ class SoftmaxAttention(nn.Module):
             max_seqlen_kv: max KV length
             sp_group: sequence parallel group for ring attention
             causal: apply causal masking
+            freq_cis: [total_tokens, ...] RoPE frequencies (applied to Q and K if provided)
         """
         q = self.wq(x).view(-1, self.n_heads, self.head_dim)
 
         kv_input = kv if kv is not None else x
         k = self.wk(kv_input).view(-1, self.n_kv_heads, self.head_dim)
         v = self.wv(kv_input).view(-1, self.n_kv_heads, self.head_dim)
+
+        if freq_cis is not None:
+            from lingua.transformer import apply_rotary_emb
+            # [T, H, D] -> [1, T, H, D] for apply_rotary_emb, then squeeze back
+            q, k = apply_rotary_emb(q.unsqueeze(0), k.unsqueeze(0), 1, freq_cis)
+            q, k = q.squeeze(0), k.squeeze(0)
 
         cu_kv = cu_seqlens_kv if cu_seqlens_kv is not None else cu_seqlens
         max_kv = max_seqlen_kv if max_seqlen_kv is not None else max_seqlen

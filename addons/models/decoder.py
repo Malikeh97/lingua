@@ -101,7 +101,7 @@ class Decoder(nn.Module):
         self.rope_embeddings = RotaryEmbedding(
             theta=10000.0,
             head_dim=head_dim,
-            max_seqlen=args.decoder_max_len,
+            max_seqlen=args.decoder_max_position,
         )
 
         self.layers = nn.ModuleList([
@@ -149,7 +149,7 @@ class Decoder(nn.Module):
         self.rope_embeddings = RotaryEmbedding(
             theta=getattr(config, "rope_theta", 10000.0),
             head_dim=head_dim,
-            max_seqlen=self.args.decoder_max_len,
+            max_seqlen=self.args.decoder_max_position,
         )
 
         # Mark pretrained params
@@ -203,6 +203,18 @@ class Decoder(nn.Module):
         outputs = layer(h, use_cache=False)
         h = outputs[0]
         return h.squeeze(0) if h.shape[0] == 1 else h
+
+    @staticmethod
+    def tokenizer_factory(args: ModelArgs):
+        """Return a callable that creates (encoder_tok, decoder_tok)."""
+        decoder_name = args.decoder_name
+
+        def factory():
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(decoder_name)
+            return tok, tok
+
+        return factory
 
     def generate(
         self,

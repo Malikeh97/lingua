@@ -18,6 +18,7 @@ import ray
 
 from addons.tasks.schema import ContextBasedExample, BatchedContextBasedExamples
 from addons.tasks.base import BaseTask
+from addons.data.collate import TokenizedBatch
 
 
 # ==================== Dataset Reader ====================
@@ -28,41 +29,78 @@ class DatasetReader:
     """
     Stateful reader for a single data source.
 
-    Wraps task's functional state-passing interface.
+    Reads raw examples, tokenizes them, returns tokenized ContextBasedExamples.
     """
 
     def __init__(
         self,
         task_cls: Type[BaseTask],
-        split: str = "train",
+        split: str,
+        tokenizer_factory,
+        doc_max_tokens: int,
+        target_max_tokens: int,
         **kwargs,
     ):
         """
         Args:
             task_cls: Task class (not instance)
             split: Data split
-            **kwargs: Passed to task's init_state
+            tokenizer_factory: Callable that returns (enc_tokenizer, dec_tokenizer)
+            doc_max_tokens: Max tokens per document
+            target_max_tokens: Max tokens per decoder sequence
+            **kwargs: Passed to task's prepare_data and init_state
         """
         self.task_cls = task_cls
+        self.split = split
+        self.kwargs = kwargs
+        self.doc_max_tokens = doc_max_tokens
+        self.target_max_tokens = target_max_tokens
+
+        # Load tokenizers locally
+        self.enc_tok, self.dec_tok = tokenizer_factory()
+
+        # Load data and init state
+        self.data = task_cls.prepare_data(split, **kwargs)
         self.state = task_cls.init_state(split, **kwargs)
 
-    def get_batch(
-        self, n: int
-    ) -> List[Union[ContextBasedExample, BatchedContextBasedExamples]]:
-        """Get next n units, update internal state."""
-        units, self.state = self.task_cls.read(self.state, n)
-        return units
+    def get_batch(self, n: int) -> List[ContextBasedExample]:
+        """Get next n units, tokenize, return tokenized examples."""
+        old_epoch = self.state.get("epoch", 0)
+        units, self.state = self.task_cls.read(self.data, self.state, n)
+
+        # Re-prepare data on epoch transition (e.g., re-shuffle)
+        new_epoch = self.state.get("epoch", 0)
+        if new_epoch > old_epoch:
+            self.data = self.task_cls.prepare_data(
+                self.split, **{**self.kwargs, "seed": self.kwargs.get("seed", 42) + new_epoch}
+            )
+
+        # Flatten and tokenize
+        results = []
+        for unit in units:
+            if isinstance(unit, ContextBasedExample):
+                results.append(unit.tokenize(
+                    self.enc_tok, self.dec_tok,
+                    self.doc_max_tokens, self.target_max_tokens,
+                ))
+            else:  # BatchedContextBasedExamples
+                for ex in unit:
+                    results.append(ex.tokenize(
+                        self.enc_tok, self.dec_tok,
+                        self.doc_max_tokens, self.target_max_tokens,
+                    ))
+        return results
 
     def is_exhausted(self) -> bool:
         """Check if this source is done."""
         return self.task_cls.is_exhausted(self.state)
 
     def state_dict(self) -> Dict[str, Any]:
-        """For checkpointing."""
+        """For checkpointing. State is already serializable."""
         return self.state
 
     def load_state_dict(self, state: Dict[str, Any]):
-        """Restore from checkpoint."""
+        """Restore from checkpoint. Data already loaded in __init__."""
         self.state = state
 
 
@@ -115,13 +153,10 @@ class Mixer:
 @ray.remote
 class Packer:
     """
-    Packs variable-length examples into fixed-token batches.
+    Packs tokenized examples into fixed-token batches.
 
-    Accepts both:
-    - ContextBasedExample: individual examples
-    - BatchedContextBasedExamples: pre-batched (e.g., one doc, many questions)
-
-    Maintains buffer for bin-packing efficiency.
+    Receives tokenized ContextBasedExamples with exact token counts.
+    Emits TokenizedBatch (on CPU — moved to GPU by DataIterator).
     Uses best-fit decreasing: always pick the largest unit that fits.
     """
 
@@ -134,9 +169,9 @@ class Packer:
         self.target_tokens = target_tokens
         self.buffer_size = buffer_size
 
-        # (unit, token_count) - unit is ContextBasedExample or BatchedContextBasedExamples
-        self.buffer: List[Tuple[Any, int]] = []
-        self.current_batch: List[Any] = []
+        # (example, token_cost)
+        self.buffer: List[Tuple[ContextBasedExample, int]] = []
+        self.current_batch: List[ContextBasedExample] = []
         self.current_tokens = 0
         self.batches_emitted = 0
 
@@ -144,15 +179,11 @@ class Packer:
         """Check if a unit with given token count can fit in current batch."""
         return self.current_tokens + token_count <= self.target_tokens
 
-    def add(
-        self,
-        unit: Union[ContextBasedExample, BatchedContextBasedExamples],
-        token_count: int,
-    ):
-        """Add example or batch to buffer."""
-        self.buffer.append((unit, token_count))
+    def add(self, example: ContextBasedExample, token_cost: int):
+        """Add tokenized example to buffer."""
+        self.buffer.append((example, token_cost))
 
-    def try_pack(self) -> Optional[BatchedContextBasedExamples]:
+    def try_pack(self) -> Optional[TokenizedBatch]:
         """
         Try to pack a batch from buffer using best-fit decreasing.
 
@@ -162,35 +193,38 @@ class Packer:
         3. Emit batch if ≥95% full or nothing fits
 
         Returns:
-            Batch if ready, None otherwise
+            TokenizedBatch if ready, None otherwise
         """
         gap = self.target_tokens - self.current_tokens
 
-        # Find all units that fit in the gap
         candidates = [(u, tc) for u, tc in self.buffer if tc <= gap]
 
         if candidates:
-            # Best-fit: pick largest that fits
             best = max(candidates, key=lambda x: x[1])
             self.buffer.remove(best)
             self.current_batch.append(best[0])
             self.current_tokens += best[1]
 
-            # Emit if batch is sufficiently full
             if self.current_tokens >= self.target_tokens * 0.95:
                 return self._emit_batch()
         elif self.current_batch:
-            # Nothing fits but we have a partial batch - emit it
+            return self._emit_batch()
+        elif self.buffer:
+            # Oversized unit — emit alone to avoid deadlock
+            oversized_ex, oversized_tc = self.buffer.pop(0)
+            print(f"[Packer WARNING] Oversized unit: {oversized_tc} tokens > target {self.target_tokens}")
+            self.current_batch.append(oversized_ex)
+            self.current_tokens = oversized_tc
             return self._emit_batch()
 
         return None
 
-    def pack_until_batch(self) -> Optional[BatchedContextBasedExamples]:
+    def pack_until_batch(self) -> Optional[TokenizedBatch]:
         """
         Keep packing from buffer until a batch is ready.
 
         Returns:
-            Batch when ready, None if buffer exhausted without completing batch
+            TokenizedBatch when ready, None if buffer exhausted
         """
         while self.buffer:
             batch = self.try_pack()
@@ -198,23 +232,15 @@ class Packer:
                 return batch
         return None
 
-    def _emit_batch(self) -> BatchedContextBasedExamples:
-        """Emit current batch, reset state."""
-        # Flatten: convert all units to list of ContextBasedExample
-        examples: List[ContextBasedExample] = []
-        for unit in self.current_batch:
-            if isinstance(unit, ContextBasedExample):
-                examples.append(unit)
-            else:  # BatchedContextBasedExamples
-                examples.extend(list(unit))  # uses __iter__
-
-        batch = BatchedContextBasedExamples.from_examples(examples)
+    def _emit_batch(self) -> TokenizedBatch:
+        """Emit current batch as TokenizedBatch (on CPU), reset state."""
+        batch = TokenizedBatch.from_tokenized_examples(self.current_batch)
         self.current_batch = []
         self.current_tokens = 0
         self.batches_emitted += 1
         return batch
 
-    def flush(self) -> Optional[BatchedContextBasedExamples]:
+    def flush(self) -> Optional[TokenizedBatch]:
         """Flush remaining units as final batch."""
         if self.current_batch:
             return self._emit_batch()
@@ -273,6 +299,9 @@ class PipelineCoordinator:
         weights: Dict[str, float],
         config: PipelineConfig,
         split: str = "train",
+        tokenizer_factory=None,
+        doc_max_tokens: int = 8192,
+        target_max_tokens: int = 2048,
         task_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     ):
         """
@@ -281,6 +310,9 @@ class PipelineCoordinator:
             weights: {name: weight}
             config: Pipeline config
             split: Data split
+            tokenizer_factory: Callable returning (enc_tok, dec_tok)
+            doc_max_tokens: Max tokens per document
+            target_max_tokens: Max tokens per decoder sequence
             task_kwargs: {name: kwargs} for task init_state
         """
         self.config = config
@@ -288,11 +320,14 @@ class PipelineCoordinator:
         self.source_names = list(task_classes.keys())
         task_kwargs = task_kwargs or {}
 
-        # Create reader actors
+        # Create reader actors (each loads its own tokenizer via factory)
         self.readers: Dict[str, ray.actor.ActorHandle] = {}
         for name, task_cls in task_classes.items():
             kwargs = task_kwargs.get(name, {})
-            self.readers[name] = DatasetReader.remote(task_cls, split, **kwargs)
+            self.readers[name] = DatasetReader.remote(
+                task_cls, split, tokenizer_factory,
+                doc_max_tokens, target_max_tokens, **kwargs,
+            )
 
         # Create mixer actor
         weight_list = [weights[name] for name in self.source_names]
@@ -304,61 +339,53 @@ class PipelineCoordinator:
         # Track exhausted sources
         self.exhausted_sources: set = set()
 
-    def get_batch(self) -> Optional[BatchedContextBasedExamples]:
+    def get_batch(self) -> Optional[TokenizedBatch]:
         """
         Get next batch (blocking).
 
         Returns:
-            Batch of examples, or None if all sources exhausted
+            TokenizedBatch (on CPU), or None if all sources exhausted
         """
-        # Keep filling packer buffer until we have a batch
         while True:
-            # Try to pack a batch from existing buffer
             batch = ray.get(self.packer.pack_until_batch.remote())
             if batch is not None:
                 return batch
 
-            # Need more data - sample from readers
             if len(self.exhausted_sources) >= len(self.source_names):
-                # All sources exhausted - flush remaining
                 return ray.get(self.packer.flush.remote())
 
-            # Sample which source to read from
             source = ray.get(self.mixer.sample_source.remote())
 
-            # Skip if exhausted
             if source in self.exhausted_sources:
                 continue
 
-            # Check if source is exhausted
             if ray.get(self.readers[source].is_exhausted.remote()):
                 self.exhausted_sources.add(source)
                 continue
 
-            # Fetch batch from reader
-            units = ray.get(
+            # Reader returns tokenized examples with exact token counts
+            examples = ray.get(
                 self.readers[source].get_batch.remote(self.config.batch_size)
             )
 
-            if not units:
+            if not examples:
                 self.exhausted_sources.add(source)
                 continue
 
-            # Record sample and add to packer
             ray.get(self.mixer.record_sample.remote(source))
-            for unit in units:
-                token_count = unit.estimate_tokens(
+            for ex in examples:
+                token_cost = ex.token_cost(
                     enc_cost=self.config.enc_token_cost,
                     dec_cost=self.config.dec_token_cost,
                 )
-                ray.get(self.packer.add.remote(unit, token_count))
+                ray.get(self.packer.add.remote(ex, token_cost))
 
     def get_batch_async(self) -> ray.ObjectRef:
         """Get next batch (non-blocking, returns ObjectRef)."""
         return self._get_batch_internal.remote(self)
 
     @ray.method(num_returns=1)
-    def _get_batch_internal(self) -> Optional[BatchedContextBasedExamples]:
+    def _get_batch_internal(self) -> Optional[TokenizedBatch]:
         """Internal method for async batch retrieval."""
         return self.get_batch()
 
@@ -423,6 +450,9 @@ def create_pipeline(
     weights: Dict[str, float],
     config: Optional[PipelineConfig] = None,
     split: str = "train",
+    tokenizer_factory=None,
+    doc_max_tokens: int = 8192,
+    target_max_tokens: int = 2048,
 ) -> ray.actor.ActorHandle:
     """
     Create a data pipeline from task configurations.
@@ -432,6 +462,9 @@ def create_pipeline(
         weights: {name: weight}
         config: Pipeline config (default: PipelineConfig())
         split: Data split
+        tokenizer_factory: Callable returning (enc_tok, dec_tok)
+        doc_max_tokens: Max tokens per document
+        target_max_tokens: Max tokens per decoder sequence
 
     Returns:
         PipelineCoordinator actor handle
@@ -448,12 +481,10 @@ def create_pipeline(
         if "task_class" in cfg:
             task_classes[name] = cfg["task_class"]
         elif "task_name" in cfg:
-            # Look up by registered name
             task_classes[name] = type(get_task(cfg["task_name"]))
         else:
             raise ValueError(f"Task config for {name} must have 'task_class' or 'task_name'")
 
-        # Everything else is kwargs
         task_kwargs[name] = {k: v for k, v in cfg.items() if k not in ("task_class", "task_name")}
 
     return PipelineCoordinator.remote(
@@ -461,6 +492,9 @@ def create_pipeline(
         weights=weights,
         config=config,
         split=split,
+        tokenizer_factory=tokenizer_factory,
+        doc_max_tokens=doc_max_tokens,
+        target_max_tokens=target_max_tokens,
         task_kwargs=task_kwargs,
     )
 

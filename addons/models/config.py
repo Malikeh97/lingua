@@ -15,7 +15,6 @@ class ModelArgs:
 
     # Encoder (used when model_type="encdec")
     encoder_name: str = "answerdotai/ModernBERT-base"
-    encoder_max_len: int = 8192
     freeze_encoder: bool = False
 
     # Encoder local attention (hybrid local/global)
@@ -25,8 +24,11 @@ class ModelArgs:
 
     # Decoder
     decoder_name: str = ""  # Pretrained decoder, empty = from-scratch
-    decoder_max_len: int = 2048
     num_decoder_layers: int = 6  # Only used when decoder_name is empty
+    decoder_max_position: int = 8192  # RoPE max sequence length
+
+    # Activation checkpointing
+    activation_checkpointing: bool = False
 
     # Cross-attention (ignored in decoder-only mode)
     # See addons/models/attention.py for kernel implementations

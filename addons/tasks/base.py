@@ -16,9 +16,10 @@ class BaseTask(ABC):
     """
     Base class for tasks.
 
-    Reading uses functional state-passing:
-    - init_state() -> state dict (task decides contents)
-    - read(state, n) -> (examples, next_state)
+    Reading uses functional state-passing with separate data and state:
+    - prepare_data(split, **kwargs) -> data (heavy, not serializable)
+    - init_state(split, **kwargs) -> state dict (lightweight, serializable)
+    - read(data, state, n) -> (examples, next_state)
     """
 
     @property
@@ -37,36 +38,53 @@ class BaseTask(ABC):
 
     @classmethod
     @abstractmethod
-    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
+    def prepare_data(cls, split: str = "train", **kwargs) -> Any:
         """
-        Initialize reading state.
+        Load/prepare the dataset. May be heavy (download, memory).
 
-        Task decides what's in the state dict:
-        - Small dataset: {"dataset": <Dataset>, "idx": 0, "epoch": 0}
-        - Streaming: {"iterator": <iter>, "buffer": [...]}
-        - With doc cache: {"idx": 0, "doc_cache": {...}}
+        The returned object is opaque — the task decides its type.
+        Not serializable; re-created on restore.
 
         Args:
             split: Data split
-            **kwargs: Task-specific options (max_epochs, streaming, etc.)
+            **kwargs: Task-specific options
 
         Returns:
-            State dict (must be serializable for checkpointing)
+            Data object (HF Dataset, iterator wrapper, etc.)
         """
         raise NotImplementedError
 
     @classmethod
     @abstractmethod
-    def read(cls, state: Dict[str, Any], batch_size: int) -> Tuple[
+    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
+        """
+        Initialize lightweight, serializable reading state.
+
+        Must be JSON-serializable for checkpointing.
+        Examples: {"idx": 0, "epoch": 0, "seed": 42}
+
+        Args:
+            split: Data split
+            **kwargs: Task-specific options
+
+        Returns:
+            State dict (must be serializable)
+        """
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def read(cls, data: Any, state: Dict[str, Any], batch_size: int) -> Tuple[
         List[Union[ContextBasedExample, BatchedContextBasedExamples]],
         Dict[str, Any],
     ]:
         """
-        Read examples from state, return next state.
+        Read examples from data using state, return next state.
 
-        Pure function: (state, n) -> (examples, next_state)
+        Pure function: (data, state, n) -> (examples, next_state)
 
         Args:
+            data: Data object from prepare_data()
             state: Current reading state
             batch_size: Number of examples to read
 

@@ -23,7 +23,77 @@ from lingua.transformer import (
 
 from .config import ModelArgs, GenerationArgs
 from .attention import SoftmaxAttention, LinearAttention, get_available_variants
+from .utils import make_packed_causal_mask, gather_encoder_states
 from addons.data.collate import TokenizedBatch
+
+
+try:
+    from flash_attn import flash_attn_varlen_func
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """ModernBERT-style RoPE: pairs (x[k], x[D/2+k]) rather than (x[2k], x[2k+1])."""
+    d = x.shape[-1] // 2
+    return torch.cat((-x[..., d:], x[..., :d]), dim=-1)
+
+
+def _apply_rotary_packed(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Apply halves-style rotary embedding to packed Q/K.
+
+    Q, K shape: [total_tokens, n_heads, head_dim]
+    cos, sin shape: [1, total_tokens, head_dim] (from HF ModernBertRotaryEmbedding)
+    """
+    if cos.dim() == 3:
+        cos = cos.squeeze(0)
+        sin = sin.squeeze(0)
+    cos = cos.unsqueeze(1)  # [T, 1, D] broadcasts over n_heads
+    sin = sin.unsqueeze(1)
+    q_out = (q.float() * cos.float() + _rotate_half(q).float() * sin.float()).to(q.dtype)
+    k_out = (k.float() * cos.float() + _rotate_half(k).float() * sin.float()).to(k.dtype)
+    return q_out, k_out
+
+
+def _patch_packed_attention(attn: nn.Module):
+    """Replace a ModernBertAttention's forward with a packed flash-attn varlen path.
+
+    The replacement reads `cu_seqlens` / `max_seqlen` set on the module before each
+    encoder forward pass. Keeps the original Wqkv / Wo parameters untouched so the
+    pretrained weights work as-is.
+    """
+    if not _HAS_FLASH_ATTN:
+        raise RuntimeError("flash_attn is required for packed encoder attention")
+
+    config = attn.config
+    n_heads = config.num_attention_heads
+    head_dim = attn.head_dim
+    hidden_size = config.hidden_size
+    # TODO: sliding-window support. For now use full attention everywhere — fine
+    # when max_seqlen <= config.local_attention/2, otherwise matches differ.
+    window_size = (-1, -1)
+
+    def packed_forward(hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
+        # hidden_states: [total_tokens, hidden_size]
+        qkv = attn.Wqkv(hidden_states)
+        qkv = qkv.view(-1, 3, n_heads, head_dim)
+        q, k, v = qkv.unbind(dim=1)  # each: [T, H, D]
+
+        cos, sin = position_embeddings
+        q, k = _apply_rotary_packed(q, k, cos, sin)
+
+        out = flash_attn_varlen_func(
+            q, k, v,
+            attn._cu_seqlens, attn._cu_seqlens,
+            attn._max_seqlen, attn._max_seqlen,
+            causal=False,
+            window_size=window_size,
+        )
+        out = out.reshape(-1, hidden_size).contiguous()
+        return attn.out_drop(attn.Wo(out)), None
+
+    attn.forward = packed_forward
 
 
 class CrossAttentionAdapter(nn.Module):
@@ -72,27 +142,32 @@ class CrossAttentionAdapter(nn.Module):
         self,
         x: torch.Tensor,
         encoder_output: torch.Tensor,
+        enc_cu_seqlens: torch.Tensor,
+        example_doc_indices: list,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
         max_seqlen_q: int,
-        max_seqlen_kv: int,
     ) -> torch.Tensor:
         """
         Args:
             x: decoder hidden states [total_dec, dim]
-            encoder_output: encoder hidden states [total_enc, dim]
+            encoder_output: deduplicated encoder states [total_unique_enc, dim]
+            enc_cu_seqlens: cumulative lengths of unique docs
+            example_doc_indices: per-example doc index mapping
             cu_seqlens_q: cumulative decoder lengths
-            cu_seqlens_kv: cumulative encoder lengths
             max_seqlen_q: max decoder length
-            max_seqlen_kv: max encoder length
         """
+        # Gather per-example encoder states (recomputed under grad checkpointing)
+        encoder_final_states, cu_seqlens_kv, max_seqlen_kv = gather_encoder_states(
+            encoder_output, enc_cu_seqlens, example_doc_indices,
+        )
+
         residual = x
         x = self.cross_attn_norm(x)
         x = self.cross_attn(
             x,
             cu_seqlens_q,
             max_seqlen_q,
-            kv=encoder_output,
+            kv=encoder_final_states,
             cu_seqlens_kv=cu_seqlens_kv,
             max_seqlen_kv=max_seqlen_kv,
             causal=False,  # Cross-attention is never causal
@@ -151,20 +226,22 @@ class EncoderDecoderBlock(nn.Module):
         x: torch.Tensor,
         encoder_output: torch.Tensor,
         freq_cis: torch.Tensor,
+        enc_cu_seqlens: torch.Tensor,
+        example_doc_indices: list,
         cu_seqlens_q: torch.Tensor,
-        cu_seqlens_kv: torch.Tensor,
         max_seqlen_q: int,
-        max_seqlen_kv: int,
+        self_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass."""
-        # Self-attention
-        h = x + self.attention(self.attention_norm(x), freq_cis, mask="causal")
+        # Self-attention (use block-diagonal mask if provided, else causal)
+        mask = self_attn_mask if self_attn_mask is not None else "causal"
+        h = x + self.attention(self.attention_norm(x), freq_cis, mask=mask)
 
-        # Cross-attention
+        # Cross-attention (gather happens inside, friendly to grad checkpointing)
         h = self.cross_attn_adapter(
             h, encoder_output,
-            cu_seqlens_q, cu_seqlens_kv,
-            max_seqlen_q, max_seqlen_kv,
+            enc_cu_seqlens, example_doc_indices,
+            cu_seqlens_q, max_seqlen_q,
         )
 
         # FFN
@@ -195,29 +272,34 @@ class EncoderDecoder(nn.Module):
         self._init_decoder(args)
 
     def _init_encoder(self, args: ModelArgs):
-        """Initialize pretrained encoder."""
+        """Initialize encoder by reusing HF ModernBERT components with packed attention.
+
+        Keeps HF's embeddings, encoder layers, final_norm, and rotary embedding
+        module unchanged, then patches each layer's self-attention to use
+        flash_attn_varlen_func with cu_seqlens. This avoids having to port RoPE
+        conventions, activations, LayerNorm bias, per-layer-type rope_theta, etc.
+        """
         config = AutoConfig.from_pretrained(args.encoder_name)
-        if hasattr(config, "attn_implementation"):
-            config.attn_implementation = "flash_attention_2"
-        if hasattr(config, "reference_compile"):
-            config.reference_compile = False
-
-        self.encoder = AutoModel.from_pretrained(
-            args.encoder_name,
-            config=config,
-            torch_dtype=torch.bfloat16,
-        )
-
         self.encoder_dim = config.hidden_size
         self.encoder_vocab_size = config.vocab_size
 
+        # Load HF ModernBERT and adopt its components.
+        hf_model = AutoModel.from_pretrained(args.encoder_name, torch_dtype=torch.bfloat16)
+        self.encoder_embeddings = hf_model.embeddings
+        self.encoder_layers = hf_model.layers
+        self.encoder_final_norm = hf_model.final_norm
+        self.encoder_rotary_emb = hf_model.rotary_emb
+        self.encoder_layer_types = list(config.layer_types)
+
+        # Replace each attention's forward with a packed flash-attn path.
+        for layer in self.encoder_layers:
+            _patch_packed_attention(layer.attn)
+
         # Freeze encoder if requested
         if args.freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            for param in self.encoder.parameters():
-                param.is_pretrained = True
-                param.is_pretrained_encoder = True
+            for name, param in self.named_parameters():
+                if name.startswith("encoder_"):
+                    param.requires_grad = False
 
     def _init_decoder(self, args: ModelArgs):
         """Initialize decoder with cross-attention adapters."""
@@ -250,7 +332,7 @@ class EncoderDecoder(nn.Module):
         self.decoder_rope = RotaryEmbedding(
             theta=10000.0,
             head_dim=head_dim,
-            max_seqlen=args.decoder_max_len,
+            max_seqlen=args.decoder_max_position,
         )
 
         # Decoder layers with cross-attention
@@ -298,7 +380,7 @@ class EncoderDecoder(nn.Module):
         self.decoder_rope = RotaryEmbedding(
             theta=getattr(config, "rope_theta", 10000.0),
             head_dim=head_dim,
-            max_seqlen=args.decoder_max_len,
+            max_seqlen=args.decoder_max_position,
         )
 
         # Create cross-attention adapters (injected between layers)
@@ -328,12 +410,7 @@ class EncoderDecoder(nn.Module):
 
     def _get_encoder_embeddings(self) -> Optional[torch.Tensor]:
         """Get encoder embedding weights."""
-        if hasattr(self.encoder, "embeddings"):
-            if hasattr(self.encoder.embeddings, "word_embeddings"):
-                return self.encoder.embeddings.word_embeddings.weight.data.float()
-            elif hasattr(self.encoder.embeddings, "tok_embeddings"):
-                return self.encoder.embeddings.tok_embeddings.weight.data.float()
-        return None
+        return self.encoder_embeddings.tok_embeddings.weight.data.float()
 
     def encode(
         self,
@@ -341,10 +418,9 @@ class EncoderDecoder(nn.Module):
         sp_group: Optional[dist.ProcessGroup] = None,
     ) -> torch.Tensor:
         """
-        Encode input documents.
+        Encode input documents using packed cu_seqlens attention.
 
-        Unpacks documents from cu_seqlens, pads into [num_docs, max_doc_len]
-        for the HF encoder, then repacks into [total_enc_tokens, hidden_dim].
+        No padding — tokens go directly through the transformer.
 
         Args:
             batch: TokenizedBatch containing encoder_tokens
@@ -355,43 +431,45 @@ class EncoderDecoder(nn.Module):
         """
         packed = batch.encoder_tokens
         device = packed.tokens.device
-        num_docs = packed.num_seqs
 
-        if num_docs == 0:
-            dim = self.encoder_dim
-            return torch.zeros(0, dim, device=device, dtype=packed.tokens.dtype)
+        if packed.num_seqs == 0:
+            return torch.zeros(0, self.encoder_dim, device=device,
+                               dtype=self.encoder_embeddings.tok_embeddings.weight.dtype)
 
-        # Unpack into individual doc tensors using cu_seqlens
-        max_len = packed.max_seqlen
-        input_ids = torch.zeros(num_docs, max_len, dtype=packed.tokens.dtype, device=device)
-        attention_mask = torch.zeros(num_docs, max_len, dtype=torch.long, device=device)
+        # Embed: HF ModernBertEmbeddings applies dropout + LayerNorm to token embeddings.
+        h = self.encoder_embeddings(packed.tokens.unsqueeze(0)).squeeze(0)  # [T, D]
 
-        for i in range(num_docs):
-            s = packed.cu_seqlens[i].item()
-            e = packed.cu_seqlens[i + 1].item()
-            length = e - s
-            input_ids[i, :length] = packed.tokens[s:e]
-            attention_mask[i, :length] = 1
+        # Build position_ids: each doc restarts from 0.
+        cu = packed.cu_seqlens
+        T = packed.tokens.shape[0]
+        position_ids = torch.zeros(T, dtype=torch.long, device=device)
+        for i in range(packed.num_seqs):
+            s = cu[i].item()
+            e = cu[i + 1].item()
+            position_ids[s:e] = torch.arange(e - s, device=device)
+        position_ids_2d = position_ids.unsqueeze(0)  # [1, T] for HF rotary_emb
 
-        # Encode [num_docs, max_doc_len]
-        outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        hidden = outputs.last_hidden_state  # [num_docs, max_doc_len, dim]
+        # Precompute RoPE per layer type (ModernBERT uses different theta for full vs sliding).
+        unique_types = set(self.encoder_layer_types)
+        rope_by_type = {
+            lt: self.encoder_rotary_emb(h, position_ids_2d, layer_type=lt)
+            for lt in unique_types
+        }
 
-        # Repack: extract non-padded tokens back to [total_enc_tokens, dim]
-        chunks = []
-        for i in range(num_docs):
-            length = packed.lengths[i]
-            chunks.append(hidden[i, :length])
-        hidden = torch.cat(chunks, dim=0)
+        # Forward through encoder layers with packed attention.
+        for i, layer in enumerate(self.encoder_layers):
+            layer.attn._cu_seqlens = cu
+            layer.attn._max_seqlen = packed.max_seqlen
+            pos_emb = rope_by_type[self.encoder_layer_types[i]]
+            h = layer(h, position_embeddings=pos_emb)
+
+        h = self.encoder_final_norm(h)
 
         # Project to decoder dim if needed
         if hasattr(self, "encoder_projection") and self.encoder_projection is not None:
-            hidden = self.encoder_projection(hidden)
+            h = self.encoder_projection(h)
 
-        return hidden
+        return h
 
     def forward(
         self,
@@ -412,8 +490,16 @@ class EncoderDecoder(nn.Module):
         Returns:
             logits: [total_dec_tokens, vocab_size]
         """
+        if _DEBUG:
+            enc = batch.encoder_tokens
+            dec = batch.decoder_tokens
+            print(f"[forward] batch: {dec.num_seqs} examples, "
+                  f"enc={enc.tokens.numel()} tokens ({enc.num_seqs} docs, max={enc.max_seqlen}), "
+                  f"dec={dec.tokens.numel()} tokens (max={dec.max_seqlen})")
+
         # Encode
         encoder_output = self.encode(batch, sp_group)
+        encoder_output = encoder_output.to(self.decoder_tok_embeddings.weight.dtype)
 
         # Decode
         decoder_tokens = batch.decoder_tokens.tokens
@@ -435,52 +521,45 @@ class EncoderDecoder(nn.Module):
         cu_seqlens_q = batch.decoder_tokens.cu_seqlens
         max_seqlen_q = batch.decoder_tokens.max_seqlen
 
-        # Build per-example cross-attention KV from encoder outputs
-        # Each decoder example attends to its specific documents
-        enc_cu = batch.encoder_tokens.cu_seqlens
-        kv_chunks = []
-        kv_lengths = []
-        for doc_indices in batch.example_doc_indices:
-            example_kvs = []
-            for idx in doc_indices:
-                s = enc_cu[idx].item()
-                e = enc_cu[idx + 1].item()
-                example_kvs.append(encoder_output[s:e])
-            cat = torch.cat(example_kvs, dim=0) if example_kvs else encoder_output[:0]
-            kv_chunks.append(cat)
-            kv_lengths.append(cat.shape[0])
-
-        cross_kv = torch.cat(kv_chunks, dim=0)
-        cu_seqlens_kv = torch.tensor(
-            [0] + list(torch.cumsum(torch.tensor(kv_lengths), dim=0)),
-            dtype=torch.int32, device=decoder_tokens.device,
+        # Block-diagonal causal mask: isolate self-attention per example
+        self_attn_mask = make_packed_causal_mask(
+            cu_seqlens_q, seqlen, decoder_tokens.device, dtype=h.dtype,
         )
-        max_seqlen_kv = max(kv_lengths) if kv_lengths else 0
+
+        # Deduplicated encoder states + mapping for cross-attention
+        # Gather happens inside each layer (friendly to gradient checkpointing)
+        enc_cu_seqlens = batch.encoder_tokens.cu_seqlens
+        example_doc_indices = batch.example_doc_indices
 
         if _DEBUG and not self._debug_cross_attn_printed:
             self._debug_cross_attn_printed = True
+            # Gather once just for debug printing
+            _, dbg_cu_kv, _ = gather_encoder_states(
+                encoder_output, enc_cu_seqlens, example_doc_indices,
+            )
             dec_cu = cu_seqlens_q
             print("[cross-attn DEBUG] First forward pass mapping:")
             print(f"  decoder: {len(batch.decoder_tokens.lengths)} seqs, cu_seqlens_q={dec_cu.tolist()}")
-            print(f"  encoder kv: {len(kv_lengths)} chunks, cu_seqlens_kv={cu_seqlens_kv.tolist()}")
+            print(f"  encoder states: {len(example_doc_indices)} chunks, cu_seqlens_kv={dbg_cu_kv.tolist()}")
             for i in range(min(2, len(batch.decoder_tokens.lengths))):
                 dq_s, dq_e = dec_cu[i].item(), dec_cu[i + 1].item()
-                kv_s, kv_e = cu_seqlens_kv[i].item(), cu_seqlens_kv[i + 1].item()
+                kv_s, kv_e = dbg_cu_kv[i].item(), dbg_cu_kv[i + 1].item()
                 print(f"  example[{i}]: dec_tokens[{dq_s}:{dq_e}] ({dq_e - dq_s} tokens) "
-                      f"attends to enc_kv[{kv_s}:{kv_e}] ({kv_e - kv_s} tokens) "
-                      f"from docs {batch.example_doc_indices[i]}")
+                      f"attends to enc_states[{kv_s}:{kv_e}] ({kv_e - kv_s} tokens) "
+                      f"from docs {example_doc_indices[i]}")
 
         if hasattr(self, "decoder_layers"):
             # From-scratch decoder with integrated cross-attention
             for layer in self.decoder_layers:
                 h = layer(
                     h.unsqueeze(0) if h.dim() == 2 else h,
-                    cross_kv.unsqueeze(0) if cross_kv.dim() == 2 else cross_kv,
+                    encoder_output,
                     freq_cis,
+                    enc_cu_seqlens,
+                    example_doc_indices,
                     cu_seqlens_q,
-                    cu_seqlens_kv,
                     max_seqlen_q,
-                    max_seqlen_kv,
+                    self_attn_mask=self_attn_mask,
                 )
                 if h.dim() == 3:
                     h = h.squeeze(0)
@@ -489,16 +568,16 @@ class EncoderDecoder(nn.Module):
             for layer, cross_attn in zip(self.pretrained_decoder_layers, self.cross_attn_adapters):
                 # Self-attention through HF layer
                 h = h.unsqueeze(0) if h.dim() == 2 else h
-                outputs = layer(h, use_cache=False)
+                outputs = layer(h, attention_mask=self_attn_mask, use_cache=False)
                 h = outputs[0]
                 if h.dim() == 3:
                     h = h.squeeze(0)
 
-                # Cross-attention adapter
+                # Cross-attention adapter (gather inside)
                 h = cross_attn(
-                    h, cross_kv,
-                    cu_seqlens_q, cu_seqlens_kv,
-                    max_seqlen_q, max_seqlen_kv,
+                    h, encoder_output,
+                    enc_cu_seqlens, example_doc_indices,
+                    cu_seqlens_q, max_seqlen_q,
                 )
 
         h = self.decoder_norm(h)
@@ -557,6 +636,24 @@ class EncoderDecoder(nn.Module):
         # Return only generated tokens (strip prompt)
         return tokens[prompt_len:].unsqueeze(0)
 
+    @staticmethod
+    def tokenizer_factory(args: ModelArgs):
+        """Return a callable that creates (encoder_tok, decoder_tok).
+
+        Serializable by Ray (closure over strings). Each worker calls it
+        once to load tokenizers locally.
+        """
+        encoder_name = args.encoder_name
+        decoder_name = args.decoder_name
+
+        def factory():
+            from transformers import AutoTokenizer
+            enc = AutoTokenizer.from_pretrained(encoder_name)
+            dec = AutoTokenizer.from_pretrained(decoder_name) if decoder_name else enc
+            return enc, dec
+
+        return factory
+
     @classmethod
     def from_pretrained(
         cls,
@@ -568,3 +665,36 @@ class EncoderDecoder(nn.Module):
         args.encoder_name = encoder_name
         args.decoder_name = decoder_name
         return cls(args)
+
+
+def _make_ckpt_forward(module: nn.Module):
+    """Wrap a module's forward with torch checkpoint."""
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+    original_forward = module.forward
+
+    def ckpt_forward(*args, **kwargs):
+        return torch_checkpoint(original_forward, *args, use_reentrant=False, **kwargs)
+
+    module.forward = ckpt_forward
+
+
+def apply_activation_checkpointing(model: nn.Module):
+    """Apply activation checkpointing to decoder layers.
+
+    Works for both from-scratch (EncoderDecoderBlock) and pretrained
+    (HF layers + CrossAttentionAdapter) decoder paths.
+
+    With the gather-inside-layer design, checkpointing means
+    the per-example encoder states are recomputed per layer during
+    backward rather than persisting — only the deduplicated
+    encoder output is kept.
+    """
+    if hasattr(model, "decoder_layers"):
+        for layer in model.decoder_layers:
+            _make_ckpt_forward(layer)
+    elif hasattr(model, "pretrained_decoder_layers"):
+        for layer, cross_attn in zip(
+            model.pretrained_decoder_layers, model.cross_attn_adapters
+        ):
+            _make_ckpt_forward(layer)
+            _make_ckpt_forward(cross_attn)

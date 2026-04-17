@@ -1,27 +1,33 @@
-# Training config for debug run
+# Multi-task training config for debug run
 # Inherits model from debug.yaml
+# Uses: config=debug.yaml,debug_multitask.yaml
 
 seed: 42
 
 # Training
-steps: 5000
+steps: 10000
 grad_acc_steps: 1
 log_interval: 100
 eval_interval: 1000
 gc_collect_freq: 1000
-run_val: false
 
 # Data
 data:
   sources:
     - task: squad
-      weight: 1.0
+      weight: 0.4
+    - task: hotpotqa
+      weight: 0.3
+    - task: fineinstructions
+      weight: 0.3
+      max_examples: 10000
+      max_doc_tokens: 8192
   target_tokens: 8192
   batch_size: 16
   packer_buffer_size: 20
   seed: 42
-  doc_max_tokens: 512
-  target_max_tokens: 128
+  doc_max_tokens: 8192
+  target_max_tokens: 512
 
 # Optimizer
 optim:
@@ -48,4 +54,4 @@ logging:
   freq: 100
   wandb:
     project: finesearch
-    name: debug
+    name: debug_multitask

@@ -32,73 +32,54 @@ class SQUADTask(BaseTask):
         return ["exact_match", "f1"]
 
     @classmethod
-    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
-        """
-        Initialize reading state.
-
-        Args:
-            split: Data split ("train" or "validation")
-            **kwargs:
-                max_examples: Optional cap on examples
-                shuffle: Whether to shuffle (default True for train)
-                seed: Random seed for shuffling
-                query_in_encoder: Put query in encoder (default True)
-        """
-        # Load dataset
+    def prepare_data(cls, split: str = "train", **kwargs):
+        """Load and prepare SQUAD dataset."""
         dataset = load_dataset("squad", split=split)
 
-        # Optional shuffle
         shuffle = kwargs.get("shuffle", split == "train")
         seed = kwargs.get("seed", 42)
         if shuffle:
             dataset = dataset.shuffle(seed=seed)
 
-        # Optional limit
         max_examples = kwargs.get("max_examples")
         if max_examples is not None:
             dataset = dataset.select(range(min(max_examples, len(dataset))))
 
-        # Query placement flag
-        query_in_encoder = kwargs.get("query_in_encoder", cls.query_in_encoder)
+        return dataset
 
+    @classmethod
+    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
+        """Initialize lightweight reading state."""
         return {
-            "dataset": dataset,
             "idx": 0,
             "epoch": 0,
             "split": split,
-            "seed": seed,
+            "seed": kwargs.get("seed", 42),
             "exhausted": False,
-            "query_in_encoder": query_in_encoder,
+            "query_in_encoder": kwargs.get("query_in_encoder", cls.query_in_encoder),
         }
 
     @classmethod
     def read(
-        cls, state: Dict[str, Any], batch_size: int
+        cls, data, state: Dict[str, Any], batch_size: int
     ) -> Tuple[
         List[Union[ContextBasedExample, BatchedContextBasedExamples]], Dict[str, Any]
     ]:
         """Read batch_size examples."""
-        dataset = state["dataset"]
         idx = state["idx"]
+        query_in_encoder = state.get("query_in_encoder", cls.query_in_encoder)
         examples = []
 
-        query_in_encoder = state.get("query_in_encoder", cls.query_in_encoder)
-
-        end_idx = min(idx + batch_size, len(dataset))
+        end_idx = min(idx + batch_size, len(data))
         for i in range(idx, end_idx):
-            raw = dataset[i]
+            raw = data[i]
             ex = cls._map_example(raw, query_in_encoder=query_in_encoder)
             examples.append(ex)
 
-        split = state.get("split", "train")
-
-        if end_idx >= len(dataset) and split == "train":
-            # Start new epoch: reset idx, bump epoch, re-shuffle
-            epoch = state.get("epoch", 0) + 1
-            base_seed = state.get("seed", 42)
+        if end_idx >= len(data) and state.get("split") == "train":
+            epoch = state["epoch"] + 1
             new_state = {
                 **state,
-                "dataset": dataset.shuffle(seed=base_seed + epoch),
                 "idx": 0,
                 "epoch": epoch,
                 "exhausted": False,
@@ -107,7 +88,7 @@ class SQUADTask(BaseTask):
             new_state = {
                 **state,
                 "idx": end_idx,
-                "exhausted": end_idx >= len(dataset),
+                "exhausted": end_idx >= len(data),
             }
         return examples, new_state
 

@@ -1,5 +1,5 @@
-# Training config for debug run
-# Inherits model from debug.yaml
+# FineInstructions-only training config
+# Uses: config=debug.yaml,debug_fineinstructions.yaml
 
 seed: 42
 
@@ -14,18 +14,21 @@ run_val: false
 # Data
 data:
   sources:
-    - task: squad
+    - task: fineinstructions
       weight: 1.0
+      max_examples: 10000
+      max_doc_tokens: 8192
+      streaming: false
   target_tokens: 8192
   batch_size: 16
   packer_buffer_size: 20
   seed: 42
-  doc_max_tokens: 512
-  target_max_tokens: 128
+  doc_max_tokens: 8192
+  target_max_tokens: 512
 
 # Optimizer
 optim:
-  lr: 0.0003
+  lr: 0.0001
   weight_decay: 0.01
   warmup: 500
   lr_min_ratio: 0.01
@@ -48,4 +51,4 @@ logging:
   freq: 100
   wandb:
     project: finesearch
-    name: debug
+    name: debug_fineinstructions

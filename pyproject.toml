@@ -20,7 +20,7 @@ dependencies = [
     "nvidia-ml-py",
     "datatrove",
     "orjson",
-    "torch==2.7.0",
+    "torch==2.8.0",
     "xformers",
     "datasets",
     "transformers",
@@ -29,11 +29,15 @@ dependencies = [
     "pip",
     "einops",
     "ray[default]",
+    "flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/flash_attn-2.7.3+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.uv.extra-build-dependencies]
 xformers = ["torch"]

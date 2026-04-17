@@ -70,13 +70,11 @@ def _parse_value(value: str) -> Any:
        (value.startswith('"') and value.endswith('"')):
         value = value[1:-1]
 
-    # YAML-style list: [a,b,c]
-    if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        items = [_parse_value(item.strip()) for item in inner.split(",")]
-        return items
+    # Complex values (lists, dicts): use YAML parser
+    if value.startswith("[") or value.startswith("{"):
+        parsed = yaml.safe_load(value)
+        if parsed is not None:
+            return parsed
 
     # Booleans
     if value.lower() in ("true", "yes"):

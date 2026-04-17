@@ -30,9 +30,8 @@ from lingua.distributed import (
 
 from addons.distributed import DistributedArgs
 
-from transformers import AutoTokenizer
-
 from addons.models.config import ModelArgs, GenerationArgs
+from addons.data.config import DataArgs
 from addons.models.encoder_decoder import EncoderDecoder
 from addons.models.decoder import Decoder
 from addons.data.collate import TokenizedBatch
@@ -46,42 +45,30 @@ logger = logging.getLogger()
 
 
 @dataclass
-class EvalArgs:
-    """Evaluation-specific configuration."""
+class EvalConfig:
+    """Evaluation configuration."""
+
+    name: str = "finesearch-eval"
+    dump_dir: str = ""
 
     # Checkpoint
     ckpt_dir: str = ""
 
-    # Tasks
-    tasks: List[str] = field(default_factory=lambda: ["squad"])
+    # Data (reuses DataArgs — eval ignores packer/mixer fields)
+    data: DataArgs = field(default_factory=DataArgs)
     split: str = "validation"
 
-    # Batching
+    # Eval settings
     batch_size: int = 8
-    max_samples: Optional[int] = None  # None = all samples
-
-    # Output
-    dump_dir: Optional[str] = None
-    metric_log_dir: Optional[str] = None
-
-    # Device
+    max_samples: Optional[int] = None
     device: str = "cuda"
 
-    # For tracking (set by train script)
-    global_step: Optional[int] = None
-
-
-@dataclass
-class EvalConfig:
-    """Full evaluation configuration."""
-
-    name: str = "finesearch-eval"
+    # Model (overridden from checkpoint params.json)
     model: ModelArgs = field(default_factory=ModelArgs)
     generation: GenerationArgs = field(default_factory=GenerationArgs)
-    eval: EvalArgs = field(default_factory=EvalArgs)
 
-    # Fallback decoder tokenizer (used when model.decoder_name is empty)
-    default_decoder_tokenizer: str = "meta-llama/Llama-3.2-1B"
+    # Tracking
+    global_step: Optional[int] = None
 
 
 # ==================== Model Loading ====================
@@ -89,7 +76,7 @@ class EvalConfig:
 
 def load_model_and_tokenizers(cfg: EvalConfig):
     """Load model from checkpoint and build tokenizers."""
-    ckpt_path = Path(cfg.eval.ckpt_dir)
+    ckpt_path = Path(cfg.ckpt_dir)
 
     consolidate_path = consolidate_checkpoints(str(ckpt_path))
 
@@ -118,14 +105,11 @@ def load_model_and_tokenizers(cfg: EvalConfig):
     else:
         model.load_state_dict(state_dict)
 
-    model = model.to(device=cfg.eval.device, dtype=torch.bfloat16).eval()
+    model = model.to(device=cfg.device, dtype=torch.bfloat16).eval()
 
     # Build tokenizers
-    encoder_tokenizer = AutoTokenizer.from_pretrained(cfg.model.encoder_name)
-    if cfg.model.decoder_name:
-        decoder_tokenizer = AutoTokenizer.from_pretrained(cfg.model.decoder_name)
-    else:
-        decoder_tokenizer = encoder_tokenizer
+    from addons.models.utils import build_tokenizers
+    encoder_tokenizer, decoder_tokenizer = build_tokenizers(cfg.model)
 
     return model, encoder_tokenizer, decoder_tokenizer
 
@@ -146,14 +130,14 @@ def generate_predictions(
 
     Tokenizes into TokenizedBatch, runs model.generate(), decodes output.
     """
-    device = torch.device(cfg.eval.device)
+    device = torch.device(cfg.device)
 
     tokenized = TokenizedBatch.from_batched_examples(
         batch,
         encoder_tokenizer,
         decoder_tokenizer,
-        cfg.model.encoder_max_len,
-        cfg.model.decoder_max_len,
+        cfg.data.doc_max_tokens,
+        cfg.data.target_max_tokens,
         device,
     ).prompt_only()
 
@@ -197,20 +181,23 @@ def evaluate_task(
     encoder_tokenizer,
     decoder_tokenizer,
     cfg: EvalConfig,
+    task_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """Evaluate model on a single task."""
-    state = task_cls.init_state(split, shuffle=False)
+    kwargs = {"shuffle": False, **(task_kwargs or {})}
+    data = task_cls.prepare_data(split, **kwargs)
+    state = task_cls.init_state(split, **kwargs)
 
     all_predictions: List[str] = []
     all_miscs: List[Dict[str, Any]] = []
 
     num_samples = 0
-    max_samples = cfg.eval.max_samples or float("inf")
+    max_samples = cfg.max_samples or float("inf")
 
     pbar = tqdm(desc=f"Evaluating {task_cls.__name__}")
 
     while not task_cls.is_exhausted(state) and num_samples < max_samples:
-        examples, state = task_cls.read(state, cfg.eval.batch_size)
+        examples, state = task_cls.read(data, state, cfg.batch_size)
 
         if not examples:
             break
@@ -266,8 +253,8 @@ def launch_eval(cfg: EvalConfig):
             pass  # Single GPU mode
 
     # Create output directory
-    if cfg.eval.dump_dir:
-        Path(cfg.eval.dump_dir).mkdir(parents=True, exist_ok=True)
+    if cfg.dump_dir:
+        Path(cfg.dump_dir).mkdir(parents=True, exist_ok=True)
 
     # Load model
     logger.info("Loading model...")
@@ -278,10 +265,15 @@ def launch_eval(cfg: EvalConfig):
     import addons.tasks.squad  # noqa: F401
     import addons.tasks.hotpotqa  # noqa: F401
 
-    # Run evaluation on each task
+    # Run evaluation on each task source
     all_results = {}
 
-    for task_name in cfg.eval.tasks:
+    for source in cfg.data.sources:
+        source = dict(source)
+        task_name = source.pop("task")
+        source.pop("weight", None)  # weight is for training mixer, not eval
+        task_kwargs = source  # remaining keys are task-specific kwargs
+
         logger.info(f"Evaluating on {task_name}...")
 
         try:
@@ -294,31 +286,32 @@ def launch_eval(cfg: EvalConfig):
         metrics = evaluate_task(
             model,
             task_cls,
-            cfg.eval.split,
+            cfg.split,
             encoder_tokenizer,
             decoder_tokenizer,
             cfg,
+            task_kwargs=task_kwargs,
         )
 
         all_results[task_name] = metrics
         logger.info(f"{task_name}: {metrics}")
 
     # Save results
-    if cfg.eval.dump_dir and get_global_rank() == 0:
-        results_path = Path(cfg.eval.dump_dir) / "results.json"
+    if cfg.dump_dir and get_global_rank() == 0:
+        results_path = Path(cfg.dump_dir) / "results.json"
         with open(results_path, "w") as f:
             json.dump(all_results, f, indent=2)
         logger.info(f"Results saved to {results_path}")
 
     # Log to metrics file
-    if cfg.eval.metric_log_dir and get_global_rank() == 0:
-        metric_log_path = Path(cfg.eval.metric_log_dir) / "metrics.eval.jsonl"
+    if cfg.dump_dir and get_global_rank() == 0:
+        metric_log_path = Path(cfg.dump_dir) / "metrics.eval.jsonl"
         log_entry: Dict[str, Any] = {
             "created_at": datetime.utcnow().isoformat(),
             "results": all_results,
         }
-        if cfg.eval.global_step is not None:
-            log_entry["global_step"] = cfg.eval.global_step
+        if cfg.global_step is not None:
+            log_entry["global_step"] = cfg.global_step
 
         with open(metric_log_path, "a") as f:
             f.write(json.dumps(log_entry) + "\n")

@@ -78,73 +78,42 @@ class LongBenchTask(BaseTask):
         return ["exact_match", "f1", "rouge1", "rouge2", "rougeL"]
 
     @classmethod
-    def init_state(cls, split: str = "test", **kwargs) -> Dict[str, Any]:
-        """
-        Initialize reading state.
-
-        Args:
-            split: Data split (LongBench only has "test")
-            **kwargs:
-                subtask: Specific subtask name (e.g., "narrativeqa", "qasper")
-                         If None, loads all subtasks
-                max_examples: Optional cap on examples
-                shuffle: Whether to shuffle
-                seed: Random seed for shuffling
-        """
+    def prepare_data(cls, split: str = "test", **kwargs):
         subtask = kwargs.get("subtask")
-
-        if subtask:
-            # Load specific subtask
-            dataset = load_dataset("THUDM/LongBench", subtask, split=split)
-        else:
-            # Load all subtasks - this would need concatenation
-            # For simplicity, require subtask specification
+        if not subtask:
             raise ValueError(
                 "LongBench requires 'subtask' parameter. "
                 f"Available: {list(LONGBENCH_INSTRUCTIONS.keys())}"
             )
-
-        # Optional shuffle
+        dataset = load_dataset("THUDM/LongBench", subtask, split=split)
         shuffle = kwargs.get("shuffle", False)
         seed = kwargs.get("seed", 42)
         if shuffle:
             dataset = dataset.shuffle(seed=seed)
-
-        # Optional limit
         max_examples = kwargs.get("max_examples")
         if max_examples is not None:
             dataset = dataset.select(range(min(max_examples, len(dataset))))
+        return dataset
 
-        return {
-            "dataset": dataset,
-            "subtask": subtask,
-            "idx": 0,
-            "exhausted": False,
-        }
+    @classmethod
+    def init_state(cls, split: str = "test", **kwargs) -> Dict[str, Any]:
+        return {"subtask": kwargs.get("subtask"), "idx": 0, "exhausted": False}
 
     @classmethod
     def read(
-        cls, state: Dict[str, Any], batch_size: int
+        cls, data, state: Dict[str, Any], batch_size: int
     ) -> Tuple[
         List[Union[ContextBasedExample, BatchedContextBasedExamples]], Dict[str, Any]
     ]:
-        """Read batch_size examples."""
-        dataset = state["dataset"]
         subtask = state["subtask"]
         idx = state["idx"]
         examples = []
-
-        end_idx = min(idx + batch_size, len(dataset))
+        end_idx = min(idx + batch_size, len(data))
         for i in range(idx, end_idx):
-            raw = dataset[i]
+            raw = data[i]
             ex = cls._map_example(raw, subtask)
             examples.append(ex)
-
-        new_state = {
-            **state,
-            "idx": end_idx,
-            "exhausted": end_idx >= len(dataset),
-        }
+        new_state = {**state, "idx": end_idx, "exhausted": end_idx >= len(data)}
         return examples, new_state
 
     @classmethod

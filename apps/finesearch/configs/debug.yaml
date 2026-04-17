@@ -9,10 +9,8 @@ dump_dir: outputs/finesearch_debug
 model:
   model_type: encdec
   encoder_name: answerdotai/ModernBERT-base
-  encoder_max_len: 512
   freeze_encoder: false
   decoder_name: ""
-  decoder_max_len: 128
   num_decoder_layers: 6
   cross_attn_layers: "all"
   cross_attn_heads: 8

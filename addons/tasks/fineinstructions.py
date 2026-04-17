@@ -71,127 +71,170 @@ class FineInstructionsTask(BaseTask):
         return ["avg_prediction_length", "avg_reference_length", "num_examples"]
 
     @classmethod
-    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
-        """
-        Initialize reading state.
-
-        Args:
-            split: Data split
-            **kwargs:
-                response_separator: Custom separator for parsing
-                streaming: Use streaming mode (default True for large dataset)
-                max_examples: Optional cap on examples
-                seed: Random seed
-        """
+    def prepare_data(cls, split: str = "train", **kwargs):
+        """Load dataset. Returns iterator (streaming) or Dataset (indexed)."""
         streaming = kwargs.get("streaming", True)
-        response_separator = kwargs.get("response_separator")
-
         dataset = load_dataset(
             "fineinstructions/fineinstructions_nemotron",
             split=split,
             streaming=streaming,
         )
-
         if streaming:
-            # For streaming, we use an iterator
-            iterator = iter(dataset)
-            return {
-                "iterator": iterator,
-                "buffer": [],
-                "response_separator": response_separator,
-                "exhausted": False,
-                "total_read": 0,
-                "max_examples": kwargs.get("max_examples"),
-            }
+            return iter(dataset)
         else:
-            # For non-streaming, shuffle and limit if needed
             shuffle = kwargs.get("shuffle", split == "train")
             seed = kwargs.get("seed", 42)
             if shuffle:
                 dataset = dataset.shuffle(seed=seed)
-
             max_examples = kwargs.get("max_examples")
             if max_examples is not None:
                 dataset = dataset.select(range(min(max_examples, len(dataset))))
+            return dataset
 
-            return {
-                "dataset": dataset,
-                "idx": 0,
-                "response_separator": response_separator,
-                "exhausted": False,
-            }
+    @classmethod
+    def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
+        streaming = kwargs.get("streaming", True)
+        return {
+            "streaming": streaming,
+            "idx": 0,
+            "response_separator": kwargs.get("response_separator"),
+            "exhausted": False,
+            "total_read": 0,
+            "max_examples": kwargs.get("max_examples"),
+            "max_doc_tokens": kwargs.get("max_doc_tokens"),  # skip examples exceeding this
+            "micro_batch_size": kwargs.get("micro_batch_size", 4),
+            # Buffer for grouping by warc_record_id
+            "pending_group": [],  # raw examples in current group
+            "pending_warc_id": None,
+            "pending_doc": None,  # shared document text for current group
+        }
 
     @classmethod
     def read(
-        cls, state: Dict[str, Any], batch_size: int
+        cls, data, state: Dict[str, Any], batch_size: int
     ) -> Tuple[
         List[Union[ContextBasedExample, BatchedContextBasedExamples]], Dict[str, Any]
     ]:
-        """Read batch_size examples."""
-        if "iterator" in state:
-            return cls._read_streaming(state, batch_size)
-        else:
-            return cls._read_indexed(state, batch_size)
+        """Read examples, grouping by warc_record_id.
 
-    @classmethod
-    def _read_streaming(
-        cls, state: Dict[str, Any], batch_size: int
-    ) -> Tuple[List[ContextBasedExample], Dict[str, Any]]:
-        """Read from streaming iterator."""
-        iterator = state["iterator"]
+        Consecutive examples sharing the same warc_record_id are bundled into
+        BatchedContextBasedExamples with a shared document, up to micro_batch_size.
+        """
         separator = state.get("response_separator")
         max_examples = state.get("max_examples")
         total_read = state.get("total_read", 0)
-        examples = []
+        micro_batch = state.get("micro_batch_size", 4)
+        streaming = state.get("streaming", True)
+        idx = state.get("idx", 0)
 
-        for _ in range(batch_size):
+        pending_group = list(state.get("pending_group", []))
+        pending_warc_id = state.get("pending_warc_id")
+        pending_doc = state.get("pending_doc")
+
+        results: List[Union[ContextBasedExample, BatchedContextBasedExamples]] = []
+        exhausted = False
+
+        def flush_group():
+            """Convert pending group into examples with shared document."""
+            nonlocal pending_group, pending_warc_id, pending_doc
+            if not pending_group or not pending_doc:
+                pending_group = []
+                return
+            examples = []
+            for raw in pending_group:
+                instruction = raw.get("instantiated_instruction") or ""
+                response = raw.get("answer") or ""
+                if not instruction.strip() or not response.strip():
+                    # Fallback to parsing text if structured fields missing
+                    instruction, response = parse_instruction_response(
+                        raw.get("text", ""), separator
+                    )
+                if not instruction or not response:
+                    continue
+                warc_id = raw.get("warc_record_id", "")
+                template_id = raw.get("template_id", "")
+                examples.append(ContextBasedExample.from_raw(
+                    documents=[pending_doc],
+                    query=instruction,
+                    target_text=response,
+                    example_id=f"{warc_id}_{template_id}" if warc_id else f"fi_{hash(instruction) % 1000000}",
+                    source="fineinstructions",
+                    misc={
+                        "warc_record_id": warc_id,
+                        "token_count": raw.get("token_count", 0),
+                        "template_id": template_id,
+                    },
+                ))
+            if len(examples) == 1:
+                results.append(examples[0])
+            elif len(examples) > 1:
+                results.append(BatchedContextBasedExamples.from_examples(examples))
+            pending_group = []
+
+        while len(results) < batch_size:
             if max_examples is not None and total_read >= max_examples:
                 break
-            try:
-                raw = next(iterator)
-                ex = cls._map_example(raw, separator)
-                if ex is not None:  # Skip null entries
-                    examples.append(ex)
-                    total_read += 1
-            except StopIteration:
-                new_state = {**state, "exhausted": True, "total_read": total_read}
-                return examples, new_state
 
-        new_state = {**state, "total_read": total_read}
-        return examples, new_state
+            # Get next raw example
+            raw = None
+            if streaming:
+                try:
+                    raw = next(data)
+                except StopIteration:
+                    exhausted = True
+                    break
+            else:
+                if idx >= len(data):
+                    exhausted = True
+                    break
+                raw = data[idx]
+                idx += 1
 
-    @classmethod
-    def _read_indexed(
-        cls, state: Dict[str, Any], batch_size: int
-    ) -> Tuple[List[ContextBasedExample], Dict[str, Any]]:
-        """Read from indexed dataset."""
-        dataset = state["dataset"]
-        idx = state["idx"]
-        separator = state.get("response_separator")
-        examples = []
+            if raw is None or not (raw.get("text") or "").strip():
+                continue
 
-        end_idx = min(idx + batch_size, len(dataset))
-        for i in range(idx, end_idx):
-            raw = dataset[i]
-            ex = cls._map_example(raw, separator)
-            if ex is not None:  # Skip null entries
-                examples.append(ex)
+            # Skip examples exceeding token limit (until ring attention is added)
+            max_doc_tok = state.get("max_doc_tokens")
+            if max_doc_tok:
+                text_len = len((raw.get("text") or ""))
+                estimated_tokens = text_len / 4  # rough char-to-token estimate
+                if estimated_tokens > max_doc_tok:
+                    continue
+
+            total_read += 1
+            warc_id = raw.get("warc_record_id", "")
+
+            # New group or group full?
+            if warc_id != pending_warc_id or len(pending_group) >= micro_batch:
+                flush_group()
+                pending_warc_id = warc_id
+                # First example in group provides the document
+                pending_doc = raw.get("text", "").strip()
+
+            pending_group.append(raw)
+
+        # Flush remaining group
+        flush_group()
 
         new_state = {
             **state,
-            "idx": end_idx,
-            "exhausted": end_idx >= len(dataset),
+            "idx": idx,
+            "total_read": total_read,
+            "exhausted": exhausted,
+            "pending_group": pending_group,
+            "pending_warc_id": pending_warc_id,
+            "pending_doc": pending_doc,
         }
-        return examples, new_state
+        return results, new_state
 
     @classmethod
     def _map_example(
-        cls, raw: Dict[str, Any], separator: Optional[str] = None
+        cls, raw: Dict[str, Any], separator: Optional[str] = None,
+        document: Optional[str] = None,
     ) -> Optional[ContextBasedExample]:
         """Transform FineInstructions example to unified schema."""
         text = raw.get("text")
 
-        # Skip null entries
         if text is None or not text.strip():
             return None
 
@@ -199,18 +242,18 @@ class FineInstructionsTask(BaseTask):
         token_count = raw.get("token_count", 0)
         template_i = raw.get("template_i", 0)
 
-        # Parse instruction and response
         instruction, response = parse_instruction_response(text, separator)
 
-        # Generate example_id
         example_id = (
             f"{warc_record_id}_{template_i}"
             if warc_record_id
             else f"fi_{hash(text) % 1000000}"
         )
 
+        docs = [document] if document else [text]
+
         return ContextBasedExample.from_raw(
-            documents=[],  # No external context for instruction-following
+            documents=docs,
             query=instruction,
             target_text=response,
             example_id=example_id,
