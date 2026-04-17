@@ -493,9 +493,11 @@ class EncoderDecoder(nn.Module):
         if _DEBUG:
             enc = batch.encoder_tokens
             dec = batch.decoder_tokens
+            total = enc.tokens.numel() + dec.tokens.numel()
             print(f"[forward] batch: {dec.num_seqs} examples, "
-                  f"enc={enc.tokens.numel()} tokens ({enc.num_seqs} docs, max={enc.max_seqlen}), "
-                  f"dec={dec.tokens.numel()} tokens (max={dec.max_seqlen})")
+                  f"enc={enc.tokens.numel()} ({enc.num_seqs} docs, max={enc.max_seqlen}), "
+                  f"dec={dec.tokens.numel()} (max={dec.max_seqlen}), "
+                  f"total={total}")
 
         # Encode
         encoder_output = self.encode(batch, sp_group)

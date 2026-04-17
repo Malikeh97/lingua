@@ -137,10 +137,6 @@ class ContextBasedExample:
         """Exact decoder token count. Requires .tokenize() first."""
         return self.dec_token_ids.shape[0]
 
-    def token_cost(self, enc_cost: float = 1.0, dec_cost: float = 1.0) -> int:
-        """Exact weighted token count for packing."""
-        return int(self.enc_tokens * enc_cost + self.dec_tokens * dec_cost)
-
 
 @dataclass
 class BatchedContextBasedExamples:

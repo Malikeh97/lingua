@@ -18,10 +18,9 @@ data:
       weight: 1.0
       max_examples: 10000
       max_doc_tokens: 8192
-      streaming: false
   target_tokens: 8192
   batch_size: 16
-  packer_buffer_size: 20
+  packer_buffer_size: 1000
   seed: 42
   doc_max_tokens: 8192
   target_max_tokens: 512

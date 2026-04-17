@@ -10,9 +10,12 @@ Architecture:
     DatasetReaders ──► Mixer Actor ──► Packer Actor ──► Training
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import random
+
+_DEBUG = os.environ.get("DEBUG") == "1"
 
 import ray
 
@@ -160,28 +163,39 @@ class Packer:
     Uses best-fit decreasing: always pick the largest unit that fits.
     """
 
-    def __init__(self, target_tokens: int, buffer_size: int = 50):
+    def __init__(self, target_tokens: int, buffer_size: int = 50,
+                 enc_token_cost: float = 1.0, dec_token_cost: float = 1.0):
         """
         Args:
             target_tokens: Target tokens per batch
             buffer_size: Number of units to buffer for bin-packing
+            enc_token_cost: Weight for encoder tokens
+            dec_token_cost: Weight for decoder tokens
         """
         self.target_tokens = target_tokens
         self.buffer_size = buffer_size
+        self.enc_token_cost = enc_token_cost
+        self.dec_token_cost = dec_token_cost
 
-        # (example, token_cost)
-        self.buffer: List[Tuple[ContextBasedExample, int]] = []
+        self.buffer: List[ContextBasedExample] = []
         self.current_batch: List[ContextBasedExample] = []
         self.current_tokens = 0
+        self.current_doc_hashes: set = set()  # track unique docs in current batch
         self.batches_emitted = 0
 
-    def can_fit(self, token_count: int) -> bool:
-        """Check if a unit with given token count can fit in current batch."""
-        return self.current_tokens + token_count <= self.target_tokens
+    def _marginal_cost(self, example: ContextBasedExample) -> int:
+        """Cost of adding this example, accounting for doc dedup."""
+        # Only count encoder tokens for docs not already in the batch
+        new_enc = 0
+        for h in example.document_hashes:
+            if h not in self.current_doc_hashes:
+                new_enc += example.doc_token_ids[h].shape[0]
+        dec = example.dec_tokens
+        return int(new_enc * self.enc_token_cost + dec * self.dec_token_cost)
 
-    def add(self, example: ContextBasedExample, token_cost: int):
+    def add(self, example: ContextBasedExample):
         """Add tokenized example to buffer."""
-        self.buffer.append((example, token_cost))
+        self.buffer.append(example)
 
     def try_pack(self) -> Optional[TokenizedBatch]:
         """
@@ -197,13 +211,20 @@ class Packer:
         """
         gap = self.target_tokens - self.current_tokens
 
-        candidates = [(u, tc) for u, tc in self.buffer if tc <= gap]
+        # Compute marginal cost for each buffered example (accounts for doc dedup)
+        candidates = []
+        for ex in self.buffer:
+            cost = self._marginal_cost(ex)
+            if cost <= gap:
+                candidates.append((ex, cost))
 
         if candidates:
-            best = max(candidates, key=lambda x: x[1])
-            self.buffer.remove(best)
-            self.current_batch.append(best[0])
-            self.current_tokens += best[1]
+            best_ex, best_cost = max(candidates, key=lambda x: x[1])
+            self.buffer.remove(best_ex)
+            self.current_batch.append(best_ex)
+            self.current_tokens += best_cost
+            for h in best_ex.document_hashes:
+                self.current_doc_hashes.add(h)
 
             if self.current_tokens >= self.target_tokens * 0.95:
                 return self._emit_batch()
@@ -211,10 +232,11 @@ class Packer:
             return self._emit_batch()
         elif self.buffer:
             # Oversized unit — emit alone to avoid deadlock
-            oversized_ex, oversized_tc = self.buffer.pop(0)
-            print(f"[Packer WARNING] Oversized unit: {oversized_tc} tokens > target {self.target_tokens}")
+            oversized_ex = self.buffer.pop(0)
+            cost = self._marginal_cost(oversized_ex)
+            print(f"[Packer WARNING] Oversized unit: {cost} tokens > target {self.target_tokens}")
             self.current_batch.append(oversized_ex)
-            self.current_tokens = oversized_tc
+            self.current_tokens = cost
             return self._emit_batch()
 
         return None
@@ -234,9 +256,15 @@ class Packer:
 
     def _emit_batch(self) -> TokenizedBatch:
         """Emit current batch as TokenizedBatch (on CPU), reset state."""
+        if _DEBUG:
+            fill_pct = self.current_tokens / self.target_tokens * 100
+            print(f"[Packer] emit: {len(self.current_batch)} examples, "
+                  f"{self.current_tokens}/{self.target_tokens} tokens ({fill_pct:.0f}%), "
+                  f"buffer={len(self.buffer)}")
         batch = TokenizedBatch.from_tokenized_examples(self.current_batch)
         self.current_batch = []
         self.current_tokens = 0
+        self.current_doc_hashes = set()
         self.batches_emitted += 1
         return batch
 
@@ -251,6 +279,7 @@ class Packer:
             "buffer": self.buffer.copy(),
             "current_batch": self.current_batch.copy(),
             "current_tokens": self.current_tokens,
+            "current_doc_hashes": list(self.current_doc_hashes),
             "batches_emitted": self.batches_emitted,
         }
 
@@ -258,6 +287,7 @@ class Packer:
         self.buffer = state["buffer"]
         self.current_batch = state["current_batch"]
         self.current_tokens = state["current_tokens"]
+        self.current_doc_hashes = set(state.get("current_doc_hashes", []))
         self.batches_emitted = state["batches_emitted"]
 
 
@@ -334,7 +364,10 @@ class PipelineCoordinator:
         self.mixer = Mixer.remote(self.source_names, weight_list, config.seed)
 
         # Create packer actor
-        self.packer = Packer.remote(config.target_tokens, config.packer_buffer_size)
+        self.packer = Packer.remote(
+            config.target_tokens, config.packer_buffer_size,
+            config.enc_token_cost, config.dec_token_cost,
+        )
 
         # Track exhausted sources
         self.exhausted_sources: set = set()
@@ -374,11 +407,7 @@ class PipelineCoordinator:
 
             ray.get(self.mixer.record_sample.remote(source))
             for ex in examples:
-                token_cost = ex.token_cost(
-                    enc_cost=self.config.enc_token_cost,
-                    dec_cost=self.config.dec_token_cost,
-                )
-                ray.get(self.packer.add.remote(ex, token_cost))
+                ray.get(self.packer.add.remote(ex))
 
     def get_batch_async(self) -> ray.ObjectRef:
         """Get next batch (non-blocking, returns ObjectRef)."""

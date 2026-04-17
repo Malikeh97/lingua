@@ -24,7 +24,7 @@ data:
       max_doc_tokens: 8192
   target_tokens: 8192
   batch_size: 16
-  packer_buffer_size: 20
+  packer_buffer_size: 1000
   seed: 42
   doc_max_tokens: 8192
   target_max_tokens: 512

@@ -1,6 +1,9 @@
 """FineInstructions Nemotron task implementation."""
 
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+_DEBUG = os.environ.get("DEBUG") == "1"
 
 from datasets import load_dataset
 
@@ -72,41 +75,44 @@ class FineInstructionsTask(BaseTask):
 
     @classmethod
     def prepare_data(cls, split: str = "train", **kwargs):
-        """Load dataset. Returns iterator (streaming) or Dataset (indexed)."""
-        streaming = kwargs.get("streaming", True)
-        dataset = load_dataset(
+        """Load dataset via streaming, materialize first max_examples into a list."""
+        max_examples = kwargs.get("max_examples")
+
+        ds = load_dataset(
             "fineinstructions/fineinstructions_nemotron",
             split=split,
-            streaming=streaming,
+            streaming=True,
         )
-        if streaming:
-            return iter(dataset)
-        else:
-            shuffle = kwargs.get("shuffle", split == "train")
-            seed = kwargs.get("seed", 42)
-            if shuffle:
-                dataset = dataset.shuffle(seed=seed)
-            max_examples = kwargs.get("max_examples")
-            if max_examples is not None:
-                dataset = dataset.select(range(min(max_examples, len(dataset))))
-            return dataset
+
+        # Materialize from stream — only downloads what's needed
+        rows = []
+        null_count = 0
+        for raw in ds:
+            if raw is None:
+                null_count += 1
+                print(f"[fineinstructions] WARNING: null entry at position {len(rows) + null_count} "
+                      f"(valid={len(rows)}, null={null_count})")
+                continue
+            rows.append(raw)
+            if max_examples is not None and len(rows) >= max_examples:
+                break
+        print(f"[fineinstructions] Loaded {len(rows)} examples ({null_count} null skipped)")
+
+        return rows
 
     @classmethod
     def init_state(cls, split: str = "train", **kwargs) -> Dict[str, Any]:
-        streaming = kwargs.get("streaming", True)
         return {
-            "streaming": streaming,
             "idx": 0,
             "response_separator": kwargs.get("response_separator"),
             "exhausted": False,
             "total_read": 0,
-            "max_examples": kwargs.get("max_examples"),
-            "max_doc_tokens": kwargs.get("max_doc_tokens"),  # skip examples exceeding this
+            "max_doc_tokens": kwargs.get("max_doc_tokens"),
             "micro_batch_size": kwargs.get("micro_batch_size", 4),
             # Buffer for grouping by warc_record_id
-            "pending_group": [],  # raw examples in current group
+            "pending_group": [],
             "pending_warc_id": None,
-            "pending_doc": None,  # shared document text for current group
+            "pending_doc": None,
         }
 
     @classmethod
@@ -121,10 +127,8 @@ class FineInstructionsTask(BaseTask):
         BatchedContextBasedExamples with a shared document, up to micro_batch_size.
         """
         separator = state.get("response_separator")
-        max_examples = state.get("max_examples")
         total_read = state.get("total_read", 0)
         micro_batch = state.get("micro_batch_size", 4)
-        streaming = state.get("streaming", True)
         idx = state.get("idx", 0)
 
         pending_group = list(state.get("pending_group", []))
@@ -137,7 +141,14 @@ class FineInstructionsTask(BaseTask):
         def flush_group():
             """Convert pending group into examples with shared document."""
             nonlocal pending_group, pending_warc_id, pending_doc
+            if _DEBUG and pending_group:
+                print(f"[fineinstructions] flush_group: warc={pending_warc_id}, group_size={len(pending_group)}")
             if not pending_group or not pending_doc:
+                pending_group = []
+                return
+            # Skip group if shared document exceeds token limit
+            max_doc_tok = state.get("max_doc_tokens")
+            if max_doc_tok and len(pending_doc) / 4 > max_doc_tok:
                 pending_group = []
                 return
             examples = []
@@ -145,7 +156,6 @@ class FineInstructionsTask(BaseTask):
                 instruction = raw.get("instantiated_instruction") or ""
                 response = raw.get("answer") or ""
                 if not instruction.strip() or not response.strip():
-                    # Fallback to parsing text if structured fields missing
                     instruction, response = parse_instruction_response(
                         raw.get("text", ""), separator
                     )
@@ -172,34 +182,17 @@ class FineInstructionsTask(BaseTask):
             pending_group = []
 
         while len(results) < batch_size:
-            if max_examples is not None and total_read >= max_examples:
+            if idx >= len(data):
+                exhausted = True
                 break
+            raw = data[idx]
+            idx += 1
 
-            # Get next raw example
-            raw = None
-            if streaming:
-                try:
-                    raw = next(data)
-                except StopIteration:
-                    exhausted = True
-                    break
-            else:
-                if idx >= len(data):
-                    exhausted = True
-                    break
-                raw = data[idx]
-                idx += 1
-
-            if raw is None or not (raw.get("text") or "").strip():
+            if raw is None:
                 continue
-
-            # Skip examples exceeding token limit (until ring attention is added)
-            max_doc_tok = state.get("max_doc_tokens")
-            if max_doc_tok:
-                text_len = len((raw.get("text") or ""))
-                estimated_tokens = text_len / 4  # rough char-to-token estimate
-                if estimated_tokens > max_doc_tok:
-                    continue
+            # Skip rows with no instruction or answer
+            if not (raw.get("instantiated_instruction") or "").strip():
+                continue
 
             total_read += 1
             warc_id = raw.get("warc_record_id", "")
@@ -209,7 +202,7 @@ class FineInstructionsTask(BaseTask):
                 flush_group()
                 pending_warc_id = warc_id
                 # First example in group provides the document
-                pending_doc = raw.get("text", "").strip()
+                pending_doc = (raw.get("text") or "").strip()
 
             pending_group.append(raw)
 
