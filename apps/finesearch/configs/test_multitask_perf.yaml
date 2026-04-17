@@ -1,0 +1,51 @@
+# Multi-task performance test config
+# 1 node × 4 GPUs, full eval at end
+
+seed: 42
+
+steps: 5000
+grad_acc_steps: 1
+log_interval: 100
+eval_interval: 2500
+gc_collect_freq: 1000
+run_val: true
+
+data:
+  sources:
+    - task: squad
+      weight: 0.4
+    - task: hotpotqa
+      weight: 0.3
+    - task: fineinstructions
+      weight: 0.3
+      max_examples: 10000
+      max_doc_tokens: 8192
+  target_tokens: 8192
+  batch_size: 16
+  packer_buffer_size: 1000
+  seed: 42
+  doc_max_tokens: 4096
+  target_max_tokens: 512
+
+optim:
+  lr: 0.0002
+  weight_decay: 0.01
+  warmup: 500
+  lr_min_ratio: 0.01
+  clip: 1.0
+
+distributed:
+  fsdp_type: no_shard
+  compile: false
+  model_dtype: bf16
+
+checkpoint:
+  dump:
+    every: 1000
+    keep: 5
+
+logging:
+  freq: 100
+  wandb:
+    project: finesearch
+    name: test_multitask_perf
