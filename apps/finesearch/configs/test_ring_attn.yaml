@@ -14,7 +14,7 @@ data:
   sources:
     - task: fineinstructions
       weight: 1.0
-      max_examples: 10000
+      max_examples: 50000
   target_tokens: 32768
   batch_size: 16
   packer_buffer_size: 1000

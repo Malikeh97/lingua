@@ -295,3 +295,159 @@ class TokenizedBatch:
             labels=self.labels.to(device),
             example_doc_indices=self.example_doc_indices,
         )
+
+
+_DTYPE_TO_IDX = {torch.long: 0, torch.int32: 1, torch.float32: 2, torch.bfloat16: 3, torch.float16: 4}
+_IDX_TO_DTYPE = {v: k for k, v in _DTYPE_TO_IDX.items()}
+
+
+def broadcast_batch(
+    batch: "TokenizedBatch",
+    sp_group: "torch.distributed.ProcessGroup",
+) -> "TokenizedBatch":
+    """Broadcast a TokenizedBatch from sp_rank 0 to all ranks in sp_group.
+
+    sp_rank 0 must have the full batch; other ranks receive it.
+    """
+    import torch.distributed as dist
+
+    sp_rank = dist.get_rank(sp_group)
+    device = torch.device("cuda")
+
+    def _bcast_tensor(t: torch.Tensor, dtype: torch.dtype = torch.long) -> torch.Tensor:
+        if sp_rank == 0:
+            ndim = torch.tensor([t.ndim], dtype=torch.long, device=device)
+            dtype_idx = torch.tensor([_DTYPE_TO_IDX.get(t.dtype, 0)], dtype=torch.long, device=device)
+        else:
+            ndim = torch.zeros(1, dtype=torch.long, device=device)
+            dtype_idx = torch.zeros(1, dtype=torch.long, device=device)
+        dist.broadcast(ndim, src=0, group=sp_group)
+        dist.broadcast(dtype_idx, src=0, group=sp_group)
+        actual_dtype = _IDX_TO_DTYPE[dtype_idx.item()]
+
+        if sp_rank == 0:
+            shape_tensor = torch.tensor(t.shape, dtype=torch.long, device=device)
+        else:
+            shape_tensor = torch.zeros(ndim.item(), dtype=torch.long, device=device)
+        dist.broadcast(shape_tensor, src=0, group=sp_group)
+
+        if sp_rank != 0:
+            t = torch.empty(shape_tensor.tolist(), dtype=actual_dtype, device=device)
+        else:
+            t = t.to(device)
+        dist.broadcast(t, src=0, group=sp_group)
+        return t
+
+    def _bcast_int_list(lst: list) -> list:
+        t = torch.tensor(lst, dtype=torch.long, device=device) if sp_rank == 0 else None
+        size = torch.tensor([len(lst)] if sp_rank == 0 else [0], dtype=torch.long, device=device)
+        dist.broadcast(size, src=0, group=sp_group)
+        if sp_rank != 0:
+            t = torch.empty(size.item(), dtype=torch.long, device=device)
+        dist.broadcast(t, src=0, group=sp_group)
+        return t.tolist()
+
+    # Broadcast encoder
+    enc_tokens = _bcast_tensor(batch.encoder_tokens.tokens if sp_rank == 0 else torch.empty(0))
+    enc_cu = _bcast_tensor(batch.encoder_tokens.cu_seqlens if sp_rank == 0 else torch.empty(0))
+    enc_lengths = _bcast_int_list(batch.encoder_tokens.lengths if sp_rank == 0 else [])
+
+    # Broadcast decoder
+    dec_tokens = _bcast_tensor(batch.decoder_tokens.tokens if sp_rank == 0 else torch.empty(0))
+    dec_cu = _bcast_tensor(batch.decoder_tokens.cu_seqlens if sp_rank == 0 else torch.empty(0))
+    dec_lengths = _bcast_int_list(batch.decoder_tokens.lengths if sp_rank == 0 else [])
+
+    # Broadcast labels
+    labels = _bcast_tensor(batch.labels if sp_rank == 0 else torch.empty(0))
+
+    # Broadcast example_doc_indices (list of lists of ints)
+    # Flatten: [num_examples, max_docs_per_example] padded
+    if sp_rank == 0:
+        num_ex = len(batch.example_doc_indices)
+        max_docs = max(len(d) for d in batch.example_doc_indices) if num_ex > 0 else 0
+        flat = torch.full((num_ex, max_docs), -1, dtype=torch.long, device=device)
+        for i, docs in enumerate(batch.example_doc_indices):
+            flat[i, :len(docs)] = torch.tensor(docs, dtype=torch.long)
+    else:
+        num_ex = 0
+        max_docs = 0
+
+    meta = torch.tensor([num_ex, max_docs], dtype=torch.long, device=device)
+    dist.broadcast(meta, src=0, group=sp_group)
+    num_ex, max_docs = meta[0].item(), meta[1].item()
+
+    if sp_rank != 0:
+        flat = torch.empty(num_ex, max_docs, dtype=torch.long, device=device)
+    dist.broadcast(flat, src=0, group=sp_group)
+
+    example_doc_indices = []
+    for i in range(num_ex):
+        docs = flat[i][flat[i] >= 0].tolist()
+        example_doc_indices.append(docs)
+
+    # Broadcast doc_hash_to_idx (just indices, hashes not needed for forward)
+    # We keep it empty on non-rank-0 since it's only used for dedup at packing time
+    doc_hash_to_idx = batch.doc_hash_to_idx if sp_rank == 0 else {}
+
+    return TokenizedBatch(
+        encoder_tokens=PackedSequences(tokens=enc_tokens, cu_seqlens=enc_cu, lengths=enc_lengths),
+        doc_hash_to_idx=doc_hash_to_idx,
+        decoder_tokens=PackedSequences(tokens=dec_tokens, cu_seqlens=dec_cu, lengths=dec_lengths),
+        labels=labels,
+        example_doc_indices=example_doc_indices,
+    )
+
+
+def shard_batch(
+    batch: "TokenizedBatch",
+    sp_rank: int,
+    sp_size: int,
+) -> "TokenizedBatch":
+    """Shard a TokenizedBatch by decoder examples for this sp_rank.
+
+    Encoder tokens are kept in full (needed for cross-attention ring exchange).
+    Decoder examples are split evenly across sp ranks.
+    """
+    num_examples = batch.batch_size
+    # Divide examples across ranks
+    examples_per_rank = (num_examples + sp_size - 1) // sp_size
+    start = sp_rank * examples_per_rank
+    end = min(start + examples_per_rank, num_examples)
+
+    if start >= num_examples:
+        # This rank has no examples (uneven split)
+        device = batch.decoder_tokens.tokens.device
+        return TokenizedBatch(
+            encoder_tokens=batch.encoder_tokens,
+            doc_hash_to_idx=batch.doc_hash_to_idx,
+            decoder_tokens=PackedSequences(
+                tokens=torch.empty(0, dtype=batch.decoder_tokens.tokens.dtype, device=device),
+                cu_seqlens=torch.tensor([0], dtype=torch.int32, device=device),
+                lengths=[],
+            ),
+            labels=torch.empty(0, dtype=batch.labels.dtype, device=device),
+            example_doc_indices=[],
+        )
+
+    # Extract decoder shard
+    dec_cu = batch.decoder_tokens.cu_seqlens
+    dec_start = dec_cu[start].item()
+    dec_end = dec_cu[end].item()
+
+    shard_tokens = batch.decoder_tokens.tokens[dec_start:dec_end]
+    shard_lengths = batch.decoder_tokens.lengths[start:end]
+    shard_cu = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(shard_lengths), dim=0)),
+        dtype=torch.int32,
+        device=batch.decoder_tokens.tokens.device,
+    )
+    shard_labels = batch.labels[dec_start:dec_end]
+    shard_doc_indices = batch.example_doc_indices[start:end]
+
+    return TokenizedBatch(
+        encoder_tokens=batch.encoder_tokens,  # full — needed for cross-attn ring
+        doc_hash_to_idx=batch.doc_hash_to_idx,
+        decoder_tokens=PackedSequences(tokens=shard_tokens, cu_seqlens=shard_cu, lengths=shard_lengths),
+        labels=shard_labels,
+        example_doc_indices=shard_doc_indices,
+    )

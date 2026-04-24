@@ -285,18 +285,31 @@ def train(cfg: TrainConfig):
         # Build optimizer
         optimizer, scheduler = build_optimizer(model, cfg.optim, cfg.steps)
 
-        # Build data pipeline
-        logger.info("Building data pipeline")
-        train_pipeline = build_data_pipeline(cfg.data, split="train", tokenizer_factory=tokenizer_factory)
+        # Sequence parallelism setup
+        from addons.distributed import get_sp_group, get_dp_group
+        sp_size = cfg.distributed.sp_size
+        sp_group = get_sp_group(sp_size)
+        dp_group = get_dp_group(sp_size)  # for FSDP process_group when sp_size > 1
+        sp_rank = dist.get_rank(sp_group) if sp_group else 0
+
+        if sp_group:
+            logger.info(f"Sequence parallelism: sp_size={sp_size}, sp_rank={sp_rank}, "
+                        f"dp_group_size={dist.get_world_size(dp_group)}")
+
+        # Build data pipeline — only sp_rank 0 in each sp_group fetches data
+        device = torch.device(cfg.trainer.device)
+        train_pipeline = None
+        train_iter = None
+        if sp_rank == 0:
+            logger.info("Building data pipeline")
+            train_pipeline = build_data_pipeline(cfg.data, split="train", tokenizer_factory=tokenizer_factory)
+            train_iter = DataIterator(train_pipeline, device)
+
         val_pipeline = None
-        if cfg.run_val and cfg.eval_interval > 0:
+        if cfg.run_val and cfg.eval_interval > 0 and sp_rank == 0:
             val_pipeline = build_val_pipeline(cfg.data, tokenizer_factory=tokenizer_factory)
             if val_pipeline is None:
                 logger.warning("No tasks with validation split found, disabling validation")
-
-        # Create data iterator
-        device = torch.device(cfg.trainer.device)
-        train_iter = DataIterator(train_pipeline, device)
 
         # Checkpoint manager
         checkpoint = CheckpointManager.instantiate_and_make_dir(cfg.checkpoint)
@@ -339,12 +352,20 @@ def train(cfg: TrainConfig):
                 gc.collect()
 
             # Get batch
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                # Reset iterator
-                train_iter = DataIterator(train_pipeline, device)
-                batch = next(train_iter)
+            if sp_rank == 0:
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = DataIterator(train_pipeline, device)
+                    batch = next(train_iter)
+            else:
+                batch = None
+
+            # Distribute batch across sp_group
+            if sp_group is not None:
+                from addons.data.collate import broadcast_batch, shard_batch
+                batch = broadcast_batch(batch, sp_group)
+                batch = shard_batch(batch, sp_rank, sp_size)
 
             # Track data stats
             total_examples += batch.batch_size
@@ -353,7 +374,7 @@ def train(cfg: TrainConfig):
 
             # Forward pass
             optimizer.zero_grad()
-            logits = model(batch)
+            logits = model(batch, sp_group=sp_group)
 
             # Compute loss
             shift_logits = logits[:-1].contiguous()
@@ -363,6 +384,11 @@ def train(cfg: TrainConfig):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+
+            # All-reduce loss across sp_group (each rank has a shard)
+            if sp_group is not None:
+                dist.all_reduce(loss, group=sp_group)
+                loss = loss / sp_size
 
             # Scale loss for gradient accumulation
             scaled_loss = loss / cfg.grad_acc_steps
